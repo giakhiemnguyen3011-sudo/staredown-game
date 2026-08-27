@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useFaceLandmarker } from "@/hooks/useFaceLandmarker";
 import { calcAvgEAR, EARSmoother, formatDuration } from "@/lib/ear";
-import { getSupabase, fetchHighScores, submitHighScore, HighScore } from "@/lib/supabase";
+import { getSupabase, getSupabaseConfigError, fetchHighScores, submitHighScore, HighScore } from "@/lib/supabase";
 import EyeOverlay from "@/components/EyeOverlay";
 
 // ---------- Types ----------
@@ -43,8 +43,11 @@ export default function Page() {
   const [showDebug, setShowDebug] = useState(true);
   const [playerName, setPlayerName] = useState("Player");
   const [supabaseReady, setSupabaseReady] = useState(false);
+  const [supabaseError, setSupabaseError] = useState<string | null>(null);
   const [highScores, setHighScores] = useState<HighScore[]>([]);
   const [localScores, setLocalScores] = useState<LocalScore[]>([]);
+  const [saveStatus, setSaveStatus] = useState<null | "saving" | "success" | "error">(null);
+  const [saveErrorMsg, setSaveErrorMsg] = useState<string | null>(null);
 
   // Video / MediaPipe
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -77,8 +80,13 @@ export default function Page() {
     setLocalScores(loadLocalScores());
     const savedName = typeof window !== "undefined" ? localStorage.getItem(LS_NAME_KEY) : null;
     if (savedName) setPlayerName(savedName);
-    setSupabaseReady(!!getSupabase());
-    fetchHighScores(10).then(setHighScores).catch(() => {});
+    const cfgErr = getSupabaseConfigError();
+    setSupabaseError(cfgErr);
+    setSupabaseReady(!!getSupabase() && !cfgErr);
+    fetchHighScores(10).then(setHighScores).catch((e) => {
+      console.warn("fetchHighScores failed", e);
+      setSupabaseError(String(e));
+    });
     const best = loadLocalScores()[0]?.durationMs ?? 0;
     setBestSingleMs(best);
   }, []);
@@ -343,15 +351,36 @@ export default function Page() {
     saveLocalScore(entry);
     setLocalScores(loadLocalScores());
     setBestSingleMs(loadLocalScores()[0]?.durationMs ?? dur);
-    // Supabase
+    // Supabase - show clear feedback
+    setSaveStatus("saving");
+    setSaveErrorMsg(null);
+    const cfgErr = getSupabaseConfigError();
+    if (cfgErr) {
+      setSupabaseError(cfgErr);
+      setSaveStatus("error");
+      setSaveErrorMsg(cfgErr);
+      // Keep dialog open to show error, auto-close after 4s for local save
+      setTimeout(() => setShowSaveDialog(false), 4000);
+      return;
+    }
     if (getSupabase()) {
       const res = await submitHighScore(entry.name, dur);
       if (!res.error) {
         const updated = await fetchHighScores(10);
         setHighScores(updated);
+        setSaveStatus("success");
+        setSupabaseError(null);
+        setTimeout(() => setShowSaveDialog(false), 800);
+      } else {
+        setSaveStatus("error");
+        setSaveErrorMsg(res.error);
+        setSupabaseError(res.error);
+        // Keep dialog open so user sees error
       }
+    } else {
+      setSaveStatus("success"); // local only is still success
+      setTimeout(() => setShowSaveDialog(false), 800);
     }
-    setShowSaveDialog(false);
   }, [playerName]);
 
   const handleDiscard = useCallback(() => setShowSaveDialog(false), []);
@@ -391,7 +420,7 @@ export default function Page() {
               <span className="text-white/20">•</span>
               <span className="text-white/70">{fps} FPS</span>
               <span className="text-white/20">•</span>
-              <span className={`${supabaseReady ? "text-emerald-300" : "text-white/50"}`}>{supabaseReady ? "Supabase ●" : "Local only"}</span>
+              <span title={supabaseError ?? undefined} className={`${supabaseReady ? "text-emerald-300" : supabaseError ? "text-amber-300" : "text-white/50"}`}>{supabaseReady ? "Supabase ●" : supabaseError ? `Supabase lỗi` : "Local only"}</span>
             </div>
             <a href="https://github.com" target="_blank" className="hidden sm:inline-flex text-xs px-3 py-1.5 rounded-full bg-white/10 hover:bg-white/15 border border-white/10 transition">Vercel Ready ▲</a>
           </div>
@@ -831,17 +860,28 @@ export default function Page() {
 
             {/* Save dialog */}
             {showSaveDialog && mode === "single" && phase === "finished" && (
-              <div className="rounded-[20px] border border-emerald-500/20 bg-emerald-500/10 p-4 flex flex-wrap gap-3 items-center justify-between">
-                <div>
+              <div className={`rounded-[20px] border p-4 flex flex-wrap gap-3 items-center justify-between ${saveStatus === "error" ? "border-red-500/30 bg-red-500/10" : saveStatus === "success" ? "border-emerald-500/20 bg-emerald-500/10" : "border-emerald-500/20 bg-emerald-500/10"}`}>
+                <div className="flex-1 min-w-[200px]">
                   <div className="font-bold text-sm text-emerald-200">Lưu kỷ lục {formatDuration(Math.round(elapsedMs))}?</div>
                   <div className="text-xs text-white/60">Sẽ lưu vào máy này và Supabase (nếu đã cấu hình).</div>
+                  {saveStatus === "saving" && <div className="text-xs text-amber-200 mt-1">Đang lưu...</div>}
+                  {saveStatus === "success" && supabaseReady && <div className="text-xs text-emerald-300 mt-1">✓ Đã lưu Local + Supabase!</div>}
+                  {saveStatus === "success" && !supabaseReady && <div className="text-xs text-amber-200 mt-1">✓ Đã lưu Local (Supabase chưa cấu hình).</div>}
+                  {saveStatus === "error" && <div className="text-xs text-red-300 mt-1 break-words">✗ Lỗi Supabase: {saveErrorMsg}</div>}
+                  {supabaseError && saveStatus !== "error" && <div className="text-xs text-amber-300/80 mt-1 break-words">⚠ {supabaseError}</div>}
                 </div>
                 <div className="flex gap-2">
-                  <button onClick={handleSaveScore} className="px-5 py-2 rounded-full bg-emerald-500 hover:bg-emerald-400 text-black font-bold text-sm transition">Lưu</button>
+                  <button onClick={handleSaveScore} disabled={saveStatus === "saving"} className="px-5 py-2 rounded-full bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-black font-bold text-sm transition">{saveStatus === "saving" ? "..." : "Lưu"}</button>
                   <button onClick={handleDiscard} className="px-5 py-2 rounded-full bg-white/10 hover:bg-white/15 border border-white/10 text-sm">Bỏ qua</button>
                 </div>
               </div>
             )}
+          </div>
+        )}
+        {/* Global Supabase error banner - only on menu */}
+        {supabaseError && mode === "menu" && (
+          <div className="rounded-[16px] border border-amber-500/20 bg-amber-500/10 p-3 text-xs text-amber-200 break-words mt-4">
+            ⚠ Supabase: {supabaseError} — Bảng xếp hạng online tạm không hoạt động, điểm vẫn lưu Local. Kiểm tra Vercel Env và chạy lại supabase.sql
           </div>
         )}
       </main>
