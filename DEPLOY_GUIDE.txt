@@ -1,0 +1,32 @@
+﻿HUONG DAN DEPLOY VERCEL - STAREDOWN GAME
+========================================
+1. Push code len GitHub:
+   cd D:\staredown-game
+   git init
+   git add .
+   git commit -m 'initial: staredown game'
+   git remote add origin https://github.com/<user>/staredown-game.git
+   git push -u origin main
+
+2. Vercel:
+   - vao https://vercel.com/new
+   - Import repo
+   - Framework preset: Next.js
+   - Env Variables (optional):
+     NEXT_PUBLIC_SUPABASE_URL=https://xxx.supabase.co
+     NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJ...
+   - Deploy
+
+3. Supabase:
+   - Tao project -> SQL Editor -> chay supabase.sql
+   - Lay URL/key tu Settings > API
+
+4. Test local:
+   npm run dev -> http://localhost:3000
+
+Track on dinh:
+- Model load 3-5s lan dau, WASM GPU fallback CPU
+- 30FPS, EAR + blendshape, mooth 5 khung
+- Nguong EAR mac dinh 0.22, chinh slider
+
+Luu o D:\staredown-game da xong.
