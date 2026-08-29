@@ -10,18 +10,12 @@ create table if not exists public.high_scores (
   created_at timestamptz not null default now()
 );
 
--- Cho phép đọc public, ghi public (game local không auth).
--- FIX LỖI "violates row-level security policy" nếu trước đó bạn đã bật RLS:
+-- Cho phép đọc public, ghi public (game local không auth). Nếu cần bảo mật hơn, thêm RLS + policies với anon key.
 alter table public.high_scores disable row level security;
--- Xóa policy cũ nếu có (tránh lỗi duplicate)
-drop policy if exists "Allow read" on public.high_scores;
-drop policy if exists "Allow insert" on public.high_scores;
--- Nếu bạn MUỐN bật RLS cho an toàn, hãy comment dòng disable ở trên và bỏ comment 3 dòng dưới:
+-- Nếu bạn bật RLS, dùng:
 -- alter table public.high_scores enable row level security;
 -- create policy "Allow read" on public.high_scores for select using (true);
 -- create policy "Allow insert" on public.high_scores for insert with check (true);
--- Đảm bảo anon có quyền (cần thiết nếu RLS disable vẫn lỗi):
-grant all on public.high_scores to anon, authenticated, service_role;
 
 create index if not exists high_scores_duration_idx on public.high_scores (duration_ms desc);
 create index if not exists high_scores_created_at_idx on public.high_scores (created_at desc);

@@ -12,6 +12,8 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+export const dynamic = "force-dynamic";
+
 export const metadata: Metadata = {
   title: "Staredown Game — Ai chớp mắt trước sẽ thua",
   description: "Game staredown sử dụng MediaPipe để track mắt realtime. Chế độ đơn & 2 người 1 máy. Triển khai trên Vercel.",
