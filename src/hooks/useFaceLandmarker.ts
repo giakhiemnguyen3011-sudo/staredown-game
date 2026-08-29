@@ -36,10 +36,10 @@ export function useFaceLandmarker(numFaces = 2) {
             },
             runningMode: "VIDEO",
             numFaces,
-            // Hạ ngưỡng để nhận diện được cả khi đeo kính (gọng/kính phản chiếu làm giảm confidence)
-            minFaceDetectionConfidence: 0.4,
-            minFacePresenceConfidence: 0.4,
-            minTrackingConfidence: 0.4,
+            // Hạ ngưỡng để nhận diện được cả khi đeo kính (gọng/kính phản chiếu làm giảm confidence) - 0.3 thay vì 0.5 mặc định
+            minFaceDetectionConfidence: 0.3,
+            minFacePresenceConfidence: 0.3,
+            minTrackingConfidence: 0.3,
             outputFaceBlendshapes: true,
             outputFacialTransformationMatrixes: false,
           });

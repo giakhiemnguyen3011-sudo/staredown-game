@@ -92,6 +92,7 @@ export default function Page() {
   const lastFpsFramesRef = useRef(0);
   const trackingLostFramesRef = useRef(0);
   const hasAutoSavedRef = useRef(false);
+  const lastNoFaceLogRef = useRef(0);
 
   // Load local data
   useEffect(() => {
@@ -301,12 +302,13 @@ export default function Page() {
     }
   }, [phase]);
 
-  // MediaPipe loop - tăng tần suất + ngưỡng cố định 0.2 + kết thúc ngay
+  // MediaPipe loop - fix: loop phải chạy lại khi mode thay đổi (video mới mount), không chỉ khi landmarkerReady
   useEffect(() => {
     if (!landmarkerReady || lmState.status !== "ready") return;
-    const video = videoRef.current;
-    if (!video) return;
+    if (mode === "menu") return; // menu không có video
     const landmarker = lmState.landmarker;
+    // Lấy video mỗi frame để tránh bug video null khi chuyển từ menu -> game (đã gây không detect dù model ready)
+    const getVideo = () => videoRef.current;
 
     let running = true;
 
@@ -339,8 +341,14 @@ export default function Page() {
     const loop = () => {
       if (!running) return;
       rafRef.current = requestAnimationFrame(loop);
-
-      if (!video || video.readyState < 2 || video.paused || video.ended) return;
+      const video = getVideo();
+      if (!video || video.readyState < 2 || video.paused || video.ended) {
+        // Nếu video chưa sẵn sàng, vẫn cập nhật faceCount 0 để UI hiện "Không thấy mặt"
+        if (phaseRef.current === "ready" || phaseRef.current === "countdown") {
+          // giữ warning để user biết
+        }
+        return;
+      }
       const nowMs = performance.now();
 
       try {
@@ -355,7 +363,7 @@ export default function Page() {
         setLandmarksForOverlay(sortedLandmarks);
         setFaceCount(faces.length);
 
-        // FPS calc
+        // FPS calc + debug log khi không thấy mặt dù model ready & video playing (giúp chẩn đoán kính/ánh sáng)
         frameCountRef.current++;
         if (nowMs - lastFpsTimeRef.current > 800) {
           const frames = frameCountRef.current - lastFpsFramesRef.current;
@@ -363,6 +371,13 @@ export default function Page() {
           setFps(Math.round(frames / dt));
           lastFpsTimeRef.current = nowMs;
           lastFpsFramesRef.current = frameCountRef.current;
+        }
+        if (faces.length === 0 && (phaseRef.current === "ready" || phaseRef.current === "countdown" || phaseRef.current === "playing")) {
+          if (nowMs - lastNoFaceLogRef.current > 2000) {
+            lastNoFaceLogRef.current = nowMs;
+            const v = getVideo();
+            console.log("[detect] no face", { readyState: v?.readyState, paused: v?.paused, w: v?.videoWidth, h: v?.videoHeight, phase: phaseRef.current, fps });
+          }
         }
 
         // Không chơi: preview EAR nhưng vẫn báo mất track
@@ -451,11 +466,14 @@ export default function Page() {
     };
 
     rafRef.current = requestAnimationFrame(loop);
+    // Debug: log khi loop bắt đầu để xác nhận không bị kẹt do video null như trước
+    console.log("[MediaPipe] loop started mode=", mode, " landmarkerReady=", landmarkerReady);
     return () => {
       running = false;
       cancelAnimationFrame(rafRef.current);
+      console.log("[MediaPipe] loop stopped");
     };
-  }, [landmarkerReady, lmState]);
+  }, [landmarkerReady, lmState, mode]);
 
   // Cleanup on unmount
   useEffect(() => () => stopCamera(), [stopCamera]);
@@ -923,7 +941,7 @@ export default function Page() {
 
       <footer className="mt-auto border-t border-white/5 py-5 text-center text-xs text-white/30">
         <div className="max-w-6xl mx-auto px-4">
-          © 2026 Staredown • EAR cố định 0.20 • 60 FPS • MediaPipe 478 pts • v0.2.1 • build 2026-08-29-fix-glasses
+          © 2026 Staredown • EAR cố định 0.20 • 60 FPS • MediaPipe 478 pts • v0.2.2 • build 2026-08-29-fix-loop
         </div>
       </footer>
     </div>
