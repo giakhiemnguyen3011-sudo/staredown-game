@@ -15,51 +15,49 @@ export function useFaceLandmarker(numFaces = 2) {
   const init = useCallback(async () => {
     if (landmarkerRef.current) return landmarkerRef.current;
     setState({ status: "loading" });
-    try {
-      const vision = await FilesetResolver.forVisionTasks(
-        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-      );
-      const landmarker = await FaceLandmarker.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath:
-            "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-          delegate: "GPU",
-        },
-        runningMode: "VIDEO",
-        numFaces,
-        outputFaceBlendshapes: true,
-        outputFacialTransformationMatrixes: false,
-      });
-      landmarkerRef.current = landmarker;
-      setState({ status: "ready", landmarker });
-      return landmarker;
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      console.error("[FaceLandmarker] init failed", msg);
-      // Retry with CPU delegate if GPU fails
-      try {
-        const vision = await FilesetResolver.forVisionTasks(
-          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
-        );
-        const landmarker = await FaceLandmarker.createFromOptions(vision, {
-          baseOptions: {
-            modelAssetPath:
-              "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-            delegate: "CPU",
-          },
-          runningMode: "VIDEO",
-          numFaces,
-          outputFaceBlendshapes: true,
-        });
-        landmarkerRef.current = landmarker;
-        setState({ status: "ready", landmarker });
-        return landmarker;
-      } catch (e2: unknown) {
-        const msg2 = e2 instanceof Error ? e2.message : String(e2);
-        setState({ status: "error", message: msg2 });
-        return null;
+    // FIX kính/không kính đều không track: wasm path cũ 0.10.14 không khớp @mediapipe/tasks-vision 1.0.1 -> init fail hoàn toàn
+    // npm 1.0.1 docs dùng "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm" (unversioned)
+    const wasmRoots = [
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision/wasm",
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm",
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm",
+    ];
+    const delegates: ("GPU" | "CPU")[] = ["GPU", "CPU"];
+    let lastErr: unknown = null;
+    for (const wasmRoot of wasmRoots) {
+      for (const delegate of delegates) {
+        try {
+          const vision = await FilesetResolver.forVisionTasks(wasmRoot);
+          const landmarker = await FaceLandmarker.createFromOptions(vision, {
+            baseOptions: {
+              modelAssetPath:
+                "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+              delegate,
+            },
+            runningMode: "VIDEO",
+            numFaces,
+            // Hạ ngưỡng để nhận diện được cả khi đeo kính (gọng/kính phản chiếu làm giảm confidence)
+            minFaceDetectionConfidence: 0.4,
+            minFacePresenceConfidence: 0.4,
+            minTrackingConfidence: 0.4,
+            outputFaceBlendshapes: true,
+            outputFacialTransformationMatrixes: false,
+          });
+          landmarkerRef.current = landmarker;
+          setState({ status: "ready", landmarker });
+          console.log(`[FaceLandmarker] ready via ${wasmRoot} delegate=${delegate}`);
+          return landmarker;
+        } catch (e: unknown) {
+          lastErr = e;
+          const msg = e instanceof Error ? e.message : String(e);
+          console.warn(`[FaceLandmarker] init failed wasm=${wasmRoot} delegate=${delegate}:`, msg);
+        }
       }
     }
+    const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+    console.error("[FaceLandmarker] all init attempts failed", msg);
+    setState({ status: "error", message: msg });
+    return null;
   }, [numFaces]);
 
   useEffect(() => {

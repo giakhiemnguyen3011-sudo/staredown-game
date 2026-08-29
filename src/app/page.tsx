@@ -66,7 +66,7 @@ export default function Page() {
   const elapsedRef = useRef<number>(0);
   const streamRef = useRef<MediaStream | null>(null);
 
-  const { state: lmState } = useFaceLandmarker(mode === "multi" ? 2 : 2);
+  const { state: lmState, init: initLandmarker } = useFaceLandmarker(mode === "multi" ? 2 : 2);
   const landmarkerReady = lmState.status === "ready";
 
   const [fps, setFps] = useState(0);
@@ -113,39 +113,62 @@ export default function Page() {
     if (typeof window !== "undefined") localStorage.setItem(LS_NAME_KEY, playerName);
   }, [playerName]);
 
-  // Camera lifecycle - tăng tần suất lên 60fps nếu có thể
+  // Camera lifecycle - robust cho cả kính/không kính, fallback nếu 60fps không hỗ trợ
   const startCamera = useCallback(async () => {
     setCameraError(null);
     setPhase("requesting");
     setTrackingWarning(false);
     trackingLostFramesRef.current = 0;
+    // Thử lần lượt: 1280x720@30 (ổn định nhất) -> 640x480 -> fallback không constraints
+    const tries: MediaStreamConstraints[] = [
+      { video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user", frameRate: { ideal: 30 } }, audio: false },
+      { video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" }, audio: false },
+      { video: { facingMode: "user" }, audio: false },
+    ];
+    let stream: MediaStream | null = null;
+    let lastErr: unknown = null;
+    for (const constraints of tries) {
+      try {
+        stream = await navigator.mediaDevices.getUserMedia(constraints);
+        break;
+      } catch (e) { lastErr = e; }
+    }
+    if (!stream) {
+      const msg = lastErr instanceof Error ? lastErr.message : String(lastErr);
+      setCameraError(msg.includes("Permission") ? "Bạn đã từ chối quyền camera. Hãy cho phép trong trình duyệt." : `Không mở được camera: ${msg}`);
+      setPhase("idle");
+      return;
+    }
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-          facingMode: "user",
-          frameRate: { ideal: 60, max: 60 },
-        },
-        audio: false,
-      });
       streamRef.current = stream;
       const video = videoRef.current;
-      if (!video) return;
-      video.srcObject = stream;
-      await video.play();
-      if (video.videoWidth) setVideoSize({ w: video.videoWidth, h: video.videoHeight });
-      else {
+      if (!video) {
+        // Video mount chưa xong, đợi 100ms rồi gán lại
+        await new Promise(res => setTimeout(res, 100));
+        if (!videoRef.current) {
+          setPhase("ready");
+          return;
+        }
+      }
+      const v = videoRef.current!;
+      v.srcObject = stream;
+      // Đảm bảo metadata có trước khi play
+      if (v.readyState < 1) {
         await new Promise<void>(res => {
-          const onLoaded = () => { setVideoSize({ w: video.videoWidth, h: video.videoHeight }); res(); };
-          video.addEventListener("loadedmetadata", onLoaded, { once: true });
-          setTimeout(() => res(), 1500);
+          const onLoaded = () => { res(); };
+          v.addEventListener("loadedmetadata", onLoaded, { once: true });
+          setTimeout(() => res(), 2000);
         });
       }
+      await v.play().catch(() => {
+        // Safari cần user gesture, thử lại sau countdown
+        console.warn("[camera] play() bị chặn, đợi user click Bắt đầu");
+      });
+      if (v.videoWidth) setVideoSize({ w: v.videoWidth, h: v.videoHeight });
       setPhase("ready");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
-      setCameraError(msg.includes("Permission") ? "Bạn đã từ chối quyền camera. Hãy cho phép trong trình duyệt." : msg);
+      setCameraError(`Lỗi camera: ${msg}`);
       setPhase("idle");
     }
   }, []);
@@ -784,7 +807,18 @@ export default function Page() {
                   </div>
                 )}
                 {lmState.status === "error" && (
-                  <div className="mx-4 mb-4 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-sm text-amber-200">Không tải được model MediaPipe: {lmState.message}. Thử refresh hoặc kiểm tra mạng/CDN.</div>
+                  <div className="mx-4 mb-4 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-sm text-amber-200 flex flex-col gap-2">
+                    <div>Không tải được model MediaPipe: {lmState.message}. Thử refresh hoặc kiểm tra mạng/CDN (cần truy cập cdn.jsdelivr.net & storage.googleapis.com).</div>
+                    <button onClick={() => initLandmarker()} className="self-start px-3 py-1.5 rounded-full bg-amber-500 text-black text-xs font-bold hover:bg-amber-400">↻ Thử lại tải model</button>
+                  </div>
+                )}
+                {lmState.status === "loading" && (
+                  <div className="mx-4 mb-4 p-3 rounded-xl bg-indigo-500/10 border border-indigo-500/20 text-sm text-indigo-200">Đang tải model MediaPipe 1.0.1... (lần đầu ~3-5s, hỗ trợ cả khi đeo kính)</div>
+                )}
+                {landmarkerReady && faceCount === 0 && (phase === "ready" || phase === "countdown") && (
+                  <div className="mx-4 mb-4 p-3 rounded-xl bg-white/5 border border-white/10 text-xs text-white/70">
+                    💡 Mẹo đeo kính: lau sạch kính, tránh ánh đèn phản chiếu trên tròng, ngồi cách camera 50-70cm, nhìn thẳng. Nếu vẫn “Không thấy mặt”, thử tháo kính test rồi đeo lại, hoặc bấm <b>Reload cam</b>.
+                  </div>
                 )}
               </div>
 
@@ -889,7 +923,7 @@ export default function Page() {
 
       <footer className="mt-auto border-t border-white/5 py-5 text-center text-xs text-white/30">
         <div className="max-w-6xl mx-auto px-4">
-          © 2026 Staredown • EAR cố định 0.20 • 60 FPS • MediaPipe 478 pts • v0.2.0 • build 2026-08-29
+          © 2026 Staredown • EAR cố định 0.20 • 60 FPS • MediaPipe 478 pts • v0.2.1 • build 2026-08-29-fix-glasses
         </div>
       </footer>
     </div>
