@@ -1,16 +1,17 @@
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useFaceLandmarker } from "@/hooks/useFaceLandmarker";
-import { calcAvgEAR, EARSmoother, formatDuration } from "@/lib/ear";
-import { getSupabase, getSupabaseConfigError, fetchHighScores, submitHighScore, HighScore } from "@/lib/supabase";
+import { calcAvgEAR, EARSmoother, formatDuration, getAdaptiveThreshold, isEyeClosed } from "@/lib/ear";
+import { getSupabase, getSupabaseConfigError, fetchHighScores, submitHighScore, HighScore, fetchGlobalLeaderboard } from "@/lib/supabase";
 import EyeOverlay from "@/components/EyeOverlay";
 
 // ---------- Constants ----------
-const EAR_THRESHOLD = 0.2; // cố định theo yêu cầu
-const SMOOTHER_WINDOW = 3; // nhỏ để phản ứng nhanh
+const EAR_DEFAULT = 0.2; // fallback nếu chưa hiệu chỉnh
+const SMOOTHER_WINDOW = 2; // giảm từ 3 -> 2 để phản ứng nhanh hơn 30%
 const REQUIRED_CLOSED_FRAMES = 1; // ngay lập tức khi xuống dưới ngưỡng
 const REQUIRED_OPEN_FRAMES = 1;
-const LOST_FRAMES_THRESHOLD = 8; // ~130ms @60fps, đủ lọc nhiễu nhưng vẫn nhanh
+const LOST_FRAMES_THRESHOLD = 6; // ~100ms @60fps, nhanh hơn trước (8)
+const COUNTDOWN_LOST_THRESHOLD = 4; // trong countdown chỉ cần 4 khung (~65ms) là abort ngay
 const AUTO_SAVE_MIN_MS = 500;
 
 // ---------- Types ----------
@@ -48,7 +49,7 @@ export default function Page() {
   const [bestSingleMs, setBestSingleMs] = useState(0);
   const [endReason, setEndReason] = useState<EndReason>(null);
 
-  // Settings - EAR cố định 0.2, không cho chỉnh
+  // Settings - EAR adaptive 0.17-0.24 (base 0.20) + glass/squint handling
   const [showDebug, setShowDebug] = useState(true);
   const [playerName, setPlayerName] = useState("Player");
   const [supabaseReady, setSupabaseReady] = useState(false);
@@ -58,6 +59,10 @@ export default function Page() {
   const [saveStatus, setSaveStatus] = useState<null | "saving" | "success" | "error">(null);
   const [saveErrorMsg, setSaveErrorMsg] = useState<string | null>(null);
   const [trackingWarning, setTrackingWarning] = useState(false);
+  // Global Highscore UI
+  const [globalTab, setGlobalTab] = useState<"top10" | "recent">("top10");
+  const [globalLoading, setGlobalLoading] = useState(false);
+  const [globalScoresFull, setGlobalScoresFull] = useState<HighScore[]>([]);
 
   // Video / MediaPipe
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -93,6 +98,29 @@ export default function Page() {
   const trackingLostFramesRef = useRef(0);
   const hasAutoSavedRef = useRef(false);
   const lastNoFaceLogRef = useRef(0);
+  // Adaptive EAR for glasses/squint
+  const calibrationSamplesRef = useRef<number[]>([]);
+  const adaptiveThresholdRef = useRef<number>(EAR_DEFAULT);
+  const [adaptiveThresholdUI, setAdaptiveThresholdUI] = useState<number>(EAR_DEFAULT);
+  // For countdown tracking lost
+  const countdownTrackingLostRef = useRef(0);
+
+  // Helpers for Global
+  const refreshGlobal = useCallback(async (limit = 20, order: "top" | "recent" = "top") => {
+    setGlobalLoading(true);
+    try {
+      const data = await fetchGlobalLeaderboard(limit, order);
+      if (order === "top") setHighScores(data.slice(0, 10));
+      setGlobalScoresFull(data);
+    } catch (e) {
+      console.warn("refreshGlobal failed", e);
+    } finally { setGlobalLoading(false); }
+  }, []);
+
+  // Refetch when tab changes
+  useEffect(() => {
+    refreshGlobal(globalTab === "recent" ? 15 : 20, globalTab === "recent" ? "recent" : "top");
+  }, [globalTab, refreshGlobal]);
 
   // Load local data
   useEffect(() => {
@@ -102,13 +130,10 @@ export default function Page() {
     const cfgErr = getSupabaseConfigError();
     setSupabaseError(cfgErr);
     setSupabaseReady(!!getSupabase() && !cfgErr);
-    fetchHighScores(10).then(setHighScores).catch((e) => {
-      console.warn("fetchHighScores failed", e);
-      setSupabaseError(String(e));
-    });
+    refreshGlobal(20);
     const best = loadLocalScores()[0]?.durationMs ?? 0;
     setBestSingleMs(best);
-  }, []);
+  }, [refreshGlobal]);
 
   useEffect(() => {
     if (typeof window !== "undefined") localStorage.setItem(LS_NAME_KEY, playerName);
@@ -120,10 +145,10 @@ export default function Page() {
     setPhase("requesting");
     setTrackingWarning(false);
     trackingLostFramesRef.current = 0;
-    // Thử lần lượt: 1280x720@30 (ổn định nhất) -> 640x480 -> fallback không constraints
+    // Ưu tiên 640x480@60 cho tốc độ tracking nhanh nhất, fallback 720p nếu cần độ nét, hỗ trợ kính
     const tries: MediaStreamConstraints[] = [
+      { video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user", frameRate: { ideal: 60, min: 30 } }, audio: false },
       { video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: "user", frameRate: { ideal: 30 } }, audio: false },
-      { video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: "user" }, audio: false },
       { video: { facingMode: "user" }, audio: false },
     ];
     let stream: MediaStream | null = null;
@@ -204,7 +229,7 @@ export default function Page() {
     return () => { /* keep camera when switching */ };
   }, [mode, startCamera, stopCamera]);
 
-  // Countdown effect
+  // Countdown effect - abort if user leaves camera (tracking lost during countdown)
   useEffect(() => {
     if (phase !== "countdown") return;
     if (countdown <= 0) {
@@ -215,9 +240,19 @@ export default function Page() {
       setEndReason(null);
       hasAutoSavedRef.current = false;
       trackingLostFramesRef.current = 0;
+      countdownTrackingLostRef.current = 0;
       setTrackingWarning(false);
       smootherRefs.current.forEach(s => s.reset());
       closedFramesRef.current = [0, 0];
+      // Finalize adaptive threshold from calibration samples collected during ready/countdown
+      if (calibrationSamplesRef.current.length >= 8) {
+        const sorted = [...calibrationSamplesRef.current].sort((a,b)=>a-b);
+        const median = sorted[Math.floor(sorted.length/2)];
+        const tuned = getAdaptiveThreshold(median);
+        adaptiveThresholdRef.current = tuned;
+        setAdaptiveThresholdUI(tuned);
+        console.log(`[EAR] calibrated median=${median.toFixed(3)} -> thresh=${tuned.toFixed(3)} (${calibrationSamplesRef.current.length} samples)`);
+      }
       return;
     }
     const t = setTimeout(() => setCountdown(c => c - 1), 900);
@@ -234,10 +269,15 @@ export default function Page() {
     setEndReason(null);
     setTrackingWarning(false);
     trackingLostFramesRef.current = 0;
+    countdownTrackingLostRef.current = 0;
     hasAutoSavedRef.current = false;
     closedFramesRef.current = [0, 0];
     openFramesRef.current = [0, 0];
     smootherRefs.current.forEach(s => s.reset());
+    // Reset calibration for new game
+    calibrationSamplesRef.current = [];
+    adaptiveThresholdRef.current = EAR_DEFAULT;
+    setAdaptiveThresholdUI(EAR_DEFAULT);
   }, [landmarkerReady, phase]);
 
   // Timer tick while playing
@@ -279,8 +319,7 @@ export default function Page() {
     if (getSupabase()) {
       submitHighScore(entry.name, dur).then(async (res) => {
         if (!res.error) {
-          const updated = await fetchHighScores(10);
-          setHighScores(updated);
+          await refreshGlobal(20);
           setSaveStatus("success");
           setSupabaseError(null);
         } else {
@@ -292,7 +331,7 @@ export default function Page() {
     } else {
       setSaveStatus("success");
     }
-  }, [phase, playerName]);
+  }, [phase, playerName, refreshGlobal]);
 
   // Reset saveStatus khi rời finished
   useEffect(() => {
@@ -338,6 +377,17 @@ export default function Page() {
       try { navigator.vibrate?.([100, 50, 100, 50]); } catch {}
     };
 
+    const handleCountdownLost = () => {
+      if (phaseRef.current !== "countdown") return;
+      console.log("[countdown] user left camera -> abort");
+      setEndReason("tracking_lost");
+      setPhase("finished");
+      setTrackingWarning(false);
+      elapsedRef.current = 0;
+      setElapsedMs(0);
+      try { navigator.vibrate?.([80, 40, 80]); } catch {}
+    };
+
     const loop = () => {
       if (!running) return;
       rafRef.current = requestAnimationFrame(loop);
@@ -380,19 +430,62 @@ export default function Page() {
           }
         }
 
-        // Không chơi: preview EAR nhưng vẫn báo mất track
+        // Không chơi: preview EAR + calibration + countdown abort
         if (phaseRef.current !== "playing") {
           const previewEars = sortedLandmarks.map(lm => calcAvgEAR(lm as never));
           setEarValues(previewEars);
           setBlinkStates(sortedLandmarks.map(() => "open" as const));
-          // warning khi không thấy mặt ở ready/countdown
-          if (phaseRef.current === "ready" || phaseRef.current === "countdown") {
+          // Calibration: collect open-eye EAR during ready/countdown (when face stable)
+          if ((phaseRef.current === "ready" || phaseRef.current === "countdown") && sortedLandmarks.length > 0) {
+            previewEars.forEach(ear => {
+              // only collect if clearly open (ear > default) to avoid closed calibration
+              if (ear > EAR_DEFAULT && ear < 0.40) {
+                calibrationSamplesRef.current.push(ear);
+                if (calibrationSamplesRef.current.length > 40) calibrationSamplesRef.current.shift();
+                // update threshold live for UI (median of samples)
+                if (calibrationSamplesRef.current.length >= 10) {
+                  const s = [...calibrationSamplesRef.current].sort((a,b)=>a-b);
+                  const med = s[Math.floor(s.length/2)];
+                  const t = getAdaptiveThreshold(med);
+                  adaptiveThresholdRef.current = t;
+                  // throttle UI update
+                  if (Math.abs(t - adaptiveThresholdUI) > 0.005) setAdaptiveThresholdUI(t);
+                }
+              }
+            });
+          }
+          // Countdown: immediately abort if user leaves camera
+          if (phaseRef.current === "countdown") {
+            if (sortedLandmarks.length === 0) {
+              countdownTrackingLostRef.current += 1;
+              setTrackingWarning(true);
+              if (countdownTrackingLostRef.current >= COUNTDOWN_LOST_THRESHOLD) {
+                handleCountdownLost();
+                return;
+              }
+            } else {
+              countdownTrackingLostRef.current = 0;
+              setTrackingWarning(false);
+            }
+            // also show preview EAR but do not return before handling?
+          } else if (phaseRef.current === "ready") {
             setTrackingWarning(faces.length === 0);
+            countdownTrackingLostRef.current = 0;
           } else {
             setTrackingWarning(false);
+            countdownTrackingLostRef.current = 0;
           }
           // reset lost counter when not playing
           trackingLostFramesRef.current = 0;
+          if (phaseRef.current !== "countdown" || sortedLandmarks.length > 0) {
+            // if countdown still OK, continue preview; abort already returned
+          }
+          if (phaseRef.current === "countdown" && sortedLandmarks.length === 0) {
+            // keep showing countdown warning without going to playing logic
+            return;
+          }
+          if (phaseRef.current !== "countdown") return;
+          // even in countdown with face present, we still preview and return (not playing logic)
           return;
         }
 
@@ -419,20 +512,18 @@ export default function Page() {
         sortedLandmarks.forEach((lm, sortedIdx) => {
           const rawEar = calcAvgEAR(lm as never);
           const blend = indexed[sortedIdx]?.blend;
-          let blendClosed = false;
+          let avgBlend: number | null = null;
           if (blend?.categories) {
             const left = blend.categories.find(c => c.categoryName === "eyeBlinkLeft");
             const right = blend.categories.find(c => c.categoryName === "eyeBlinkRight");
-            const avgBlend = ((left?.score ?? 0) + (right?.score ?? 0)) / 2;
-            blendClosed = avgBlend > 0.55;
-            if (avgBlend > 0.65) blendClosed = true;
+            avgBlend = ((left?.score ?? 0) + (right?.score ?? 0)) / 2;
           }
           const smoother = smootherRefs.current[sortedIdx] ?? (smootherRefs.current[sortedIdx] = new EARSmoother(SMOOTHER_WINDOW));
           const ear = smoother.push(rawEar);
           newEars.push(ear);
 
-          const isClosedByEar = ear < EAR_THRESHOLD;
-          const isClosed = isClosedByEar || blendClosed;
+          const thresh = adaptiveThresholdRef.current ?? EAR_DEFAULT;
+          const isClosed = isEyeClosed(ear, avgBlend, thresh);
 
           if (isClosed) {
             closedFramesRef.current[sortedIdx] = (closedFramesRef.current[sortedIdx] ?? 0) + 1;
@@ -497,7 +588,7 @@ export default function Page() {
             </div>
             <div className="text-left">
               <div className="font-black tracking-tight leading-none text-[17px]">STAREDOWN</div>
-              <div className="text-[11px] tracking-[0.18em] text-white/60 -mt-0.5">EAR 0.20 • 60FPS • MEDIAPIPE</div>
+              <div className="text-[11px] tracking-[0.18em] text-white/60 -mt-0.5">EAR {mode !== "menu" ? adaptiveThresholdUI.toFixed(2) : "ADAPTIVE"} • 60FPS • MEDIAPIPE</div>
             </div>
           </button>
 
@@ -524,7 +615,7 @@ export default function Page() {
               <div className="absolute inset-0 bg-gradient-to-br from-indigo-600/20 via-transparent to-fuchsia-600/10 pointer-events-none" />
               <div className="relative">
                 <div className="inline-flex items-center gap-2 text-[11px] tracking-widest font-semibold px-3 py-1 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300">
-                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" /> NGƯỠNG EAR CỐ ĐỊNH 0.20 • KẾT THÚC NGAY KHI NHẮM
+                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" /> NGƯỠNG EAR TỰ ĐỘNG {adaptiveThresholdUI.toFixed(2)} (0.17-0.24) • KẾT THÚC NGAY KHI NHẮM • CHỐNG NHEO + HỖ TRỢ KÍNH
                 </div>
                 <h1 className="mt-3 text-3xl sm:text-[40px] font-black tracking-tight leading-[0.95]">
                   AI CHỚP MẮT <span className="bg-gradient-to-r from-indigo-400 via-violet-400 to-fuchsia-400 bg-clip-text text-transparent">TRƯỚC SẼ THUA</span>
@@ -535,7 +626,7 @@ export default function Page() {
                 <div className="mt-4 flex flex-wrap gap-2 text-xs">
                   <span className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10">Best: <b className="font-mono text-white">{bestSingleMs ? formatDuration(bestSingleMs) : "--"}</b></span>
                   <span className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10">{localScores.length} lượt • Top {Math.min(localScores.length,5)} local</span>
-                  <span className="px-3 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/20 text-emerald-200">● Live EAR 0.20</span>
+                  <span className="px-3 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/20 text-emerald-200">● Live EAR {adaptiveThresholdUI.toFixed(2)}</span>
                 </div>
               </div>
             </div>
@@ -550,7 +641,7 @@ export default function Page() {
                 </div>
                 <div className="space-y-1.5">
                   <div className="text-white font-bold flex gap-2"><span className="w-6 h-6 rounded-full bg-white text-black flex items-center justify-center text-xs font-black">2</span> Bắt đầu</div>
-                  <p className="text-white/60 leading-relaxed text-[13px]">Bấm “Bắt đầu” → đếm 3-2-1 → giữ mắt mở. Hệ thống dừng ngay khi EAR &lt; 0.20.</p>
+                  <p className="text-white/60 leading-relaxed text-[13px]">Bấm “Bắt đầu” → đếm 3-2-1 → giữ mắt mở. Nhắm mắt là thua ngay (EAR tự động {adaptiveThresholdUI.toFixed(2)}, chống nheo). Rời khung trong countdown cũng thua.</p>
                 </div>
                 <div className="space-y-1.5">
                   <div className="text-white font-bold flex gap-2"><span className="w-6 h-6 rounded-full bg-white text-black flex items-center justify-center text-xs font-black">3</span> Giữ khung hình</div>
@@ -560,7 +651,7 @@ export default function Page() {
               <div className="mt-4 flex flex-wrap gap-2 text-xs">
                 <span className="px-3 py-1.5 rounded-full bg-amber-500/15 border border-amber-500/20 text-amber-200">⚠️ Không đeo kính râm</span>
                 <span className="px-3 py-1.5 rounded-full bg-indigo-500/15 border border-indigo-500/20 text-indigo-200">💡 Ánh sáng đều, tránh ngược sáng</span>
-                <span className="px-3 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/20 text-emerald-200">🎥 60 FPS • ngưỡng 0.20</span>
+                <span className="px-3 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/20 text-emerald-200">🎥 60 FPS • ngưỡng {adaptiveThresholdUI.toFixed(2)} (auto)</span>
                 <span className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-white/70">Rời khung = tự thua</span>
               </div>
             </div>
@@ -572,7 +663,7 @@ export default function Page() {
                 <div className="relative">
                   <div className="w-12 h-12 rounded-2xl bg-indigo-500 flex items-center justify-center text-xl shadow-lg shadow-indigo-500/20">🎯</div>
                   <h3 className="mt-4 text-xl font-extrabold">Local Highscore</h3>
-                  <p className="text-sm text-white/65 mt-1">1 người • Tự động lưu kỷ lục sau mỗi ván. EAR 0.20.</p>
+                  <p className="text-sm text-white/65 mt-1">1 người • Tự động lưu kỷ lục sau mỗi ván. EAR tự động.</p>
                   <ul className="mt-3 space-y-1.5 text-xs text-white/70">
                     <li className="flex gap-2"><span className="text-emerald-400">✓</span> Countdown 3-2-1 rồi tính giờ</li>
                     <li className="flex gap-2"><span className="text-emerald-400">✓</span> Chớp = thua ngay • Rời khung = thua</li>
@@ -600,6 +691,53 @@ export default function Page() {
                   </div>
                 </div>
               </button>
+            </div>
+
+            {/* Global Highscore - NEW */}
+            <div className="rounded-[24px] border border-emerald-500/20 bg-gradient-to-br from-emerald-600/10 via-white/[0.03] to-transparent backdrop-blur p-6">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <h4 className="font-black flex items-center gap-2 text-sm tracking-widest text-emerald-200"><span className="w-7 h-7 rounded-lg bg-emerald-500/20 flex items-center justify-center">🌍</span> GLOBAL HIGHSCORE</h4>
+                <div className="flex items-center gap-2">
+                  <div className="flex p-1 rounded-full bg-white/5 border border-white/10">
+                    <button onClick={() => setGlobalTab("top10")} className={`px-3 py-1 rounded-full text-xs font-bold transition ${globalTab === "top10" ? "bg-emerald-500 text-white shadow" : "text-white/60 hover:text-white"}`}>Top</button>
+                    <button onClick={() => setGlobalTab("recent")} className={`px-3 py-1 rounded-full text-xs font-bold transition ${globalTab === "recent" ? "bg-emerald-500 text-white shadow" : "text-white/60 hover:text-white"}`}>Mới nhất</button>
+                  </div>
+                  <button onClick={() => refreshGlobal(globalTab === "recent" ? 15 : 20, globalTab === "recent" ? "recent" : "top")} disabled={globalLoading} className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-xs hover:bg-white/10 disabled:opacity-50">↻ {globalLoading ? "..." : "Làm mới"}</button>
+                </div>
+              </div>
+              <div className="mt-1 text-xs text-white/50">Lưu vào Supabase • {supabaseReady ? `sẵn sàng • ${globalScoresFull.length} bản ghi` : supabaseError ?? "chưa cấu hình"} • Tên: <b className="text-white">{playerName}</b></div>
+              <div className="mt-4">
+                {globalLoading ? (
+                  <div className="py-8 text-center text-sm text-white/50">Đang tải bảng xếp hạng toàn cầu...</div>
+                ) : !supabaseReady ? (
+                  <div className="py-6 text-center text-sm text-amber-200 bg-amber-500/10 border border-amber-500/20 rounded-xl">Chưa cấu hình Supabase — bảng Global trống. Hãy thêm <code className="px-1 py-0.5 bg-white/10 rounded">NEXT_PUBLIC_SUPABASE_URL</code> trong <code>.env.local</code> rồi chạy lại <code>supabase.sql</code>.</div>
+                ) : globalScoresFull.length === 0 ? (
+                  <div className="py-8 text-center text-sm text-white/50 border border-dashed border-white/10 rounded-xl">Chưa có kỷ lục toàn cầu — hãy là người đầu tiên!</div>
+                ) : (
+                  <div className="space-y-2 max-h-[320px] overflow-auto pr-1">
+                    {globalScoresFull.map((h, i) => {
+                      const isMe = h.player_name === playerName.trim() && playerName.trim().length>0;
+                      return (
+                        <div key={h.id} className={`flex items-center gap-3 p-2.5 rounded-xl border transition ${isMe ? "bg-emerald-500/15 border-emerald-500/30 shadow shadow-emerald-500/10" : "bg-white/5 border-white/5 hover:bg-white/[0.07]"}`}>
+                          <div className={`w-8 h-8 rounded-full flex items-center justify-center text-xs font-black shrink-0 ${i===0?"bg-amber-400 text-black":i===1?"bg-zinc-300 text-black":i===2?"bg-amber-700 text-white":"bg-white/10 text-white"}`}>{i+1}</div>
+                          <div className="flex-1 min-w-0">
+                            <div className={`text-sm font-bold truncate ${isMe?"text-emerald-300":""}`}>{h.player_name} {isMe && <span className="ml-1 text-[10px] px-1.5 py-0.5 rounded-full bg-emerald-500 text-white align-middle">YOU</span>}</div>
+                            <div className="text-xs text-white/45">{new Date(h.created_at).toLocaleString("vi-VN")} • #{h.id.slice(0,6)}</div>
+                          </div>
+                          <div className="text-right">
+                            <div className="font-mono font-black text-emerald-200">{formatDuration(h.duration_ms)}</div>
+                            <div className="text-[11px] text-white/40">{(h.duration_ms/1000).toFixed(2)}s</div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+              <div className="mt-3 text-xs text-white/40 flex flex-wrap gap-2 items-center justify-between">
+                <span>Global sync sau mỗi ván • tự động làm mới</span>
+                {supabaseReady && globalScoresFull.length>0 && <span className="text-emerald-300">● Live Supabase</span>}
+              </div>
             </div>
 
             {/* Highscore rút gọn + settings */}
@@ -648,8 +786,8 @@ export default function Page() {
                   <span className="text-white/70">Hiện overlay mắt</span>
                 </label>
                 <div className="rounded-xl bg-indigo-500/10 border border-indigo-500/20 p-3 text-xs leading-relaxed">
-                  <div className="font-bold text-indigo-200">Ngưỡng cố định</div>
-                  <div className="text-white/70 mt-1">EAR = <b className="text-white">0.20</b> • Smoother 3 • Đóng 1 frame = thua ngay. Không cần chỉnh thủ công.</div>
+                  <div className="font-bold text-indigo-200">Ngưỡng tự động</div>
+                  <div className="text-white/70 mt-1">EAR = <b className="text-white">{adaptiveThresholdUI.toFixed(2)}</b> (0.17-0.24) • Smoother {SMOOTHER_WINDOW} (EMA) • Đóng 1 frame = thua ngay • Tự hiệu chỉnh khi mở mắt, chống nheo + hỗ trợ kính.</div>
                 </div>
                 {supabaseError && (
                   <div className="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/20 rounded-xl p-2.5 break-words">⚠ Supabase: {supabaseError}</div>
@@ -668,7 +806,7 @@ export default function Page() {
                 <span className={`px-3 py-1.5 rounded-full border text-xs font-semibold ${phase === "playing" ? "bg-emerald-500 text-white border-emerald-400 animate-pulse" : phase === "countdown" ? "bg-amber-500 text-black border-amber-400" : phase === "finished" ? (endReason === "tracking_lost" ? "bg-red-600 text-white border-red-500" : "bg-red-500 text-white border-red-400") : "bg-white/10 border-white/10"}`}>
                   {phase === "idle" && "Chờ camera"}
                   {phase === "requesting" && "Đang xin quyền camera..."}
-                  {phase === "ready" && "Sẵn sàng • EAR 0.20"}
+                  {phase === "ready" && `Sẵn sàng • EAR ${adaptiveThresholdUI.toFixed(2)}`}
                   {phase === "countdown" && `Chuẩn bị... ${countdown}`}
                   {phase === "playing" && "● ĐANG CHƠI • 60FPS"}
                   {phase === "finished" && (endReason === "tracking_lost" ? "⚠ MẤT TRACK" : "Kết thúc")}
@@ -727,8 +865,13 @@ export default function Page() {
                           <>
                             <div className="w-12 h-12 mx-auto rounded-2xl bg-red-500 flex items-center justify-center text-xl">⚠️</div>
                             <div className="mt-3 text-xs tracking-[0.2em] text-red-300">MẤT TÍN HIỆU</div>
-                            <div className="mt-1 font-black text-xl leading-tight">RỜI KHỎI VÙNG CAMERA</div>
-                            <div className="mt-2 text-sm text-white/70 leading-relaxed">Bạn đã rời khỏi vùng camera / không thể track đôi mắt. Lượt chơi đã <b className="text-white">tự động kết thúc</b> và kết quả <b className="font-mono text-white">{formatDuration(Math.round(elapsedMs))}</b> đã được <b className="text-emerald-300">lưu vào Local Highscore</b>.</div>
+                            <div className="mt-1 font-black text-xl leading-tight">{elapsedMs < 500 ? "RỜI KHUNG KHI ĐẾM NGƯỢC" : "RỜI KHỎI VÙNG CAMERA"}</div>
+                            <div className="mt-2 text-sm text-white/70 leading-relaxed">
+                              {elapsedMs < 500
+                                ? <>Bạn đã rời khỏi camera trong lúc đếm ngược 3-2-1. Ván đấu đã <b className="text-white">hủy và kết thúc ngay</b> (không tính điểm, cần &gt;0.5s mới lưu).</>
+                                : <>Bạn đã rời khỏi vùng camera / không thể track đôi mắt. Lượt chơi đã <b className="text-white">tự động kết thúc</b> và kết quả <b className="font-mono text-white">{formatDuration(Math.round(elapsedMs))}</b> đã được <b className="text-emerald-300">lưu vào Local Highscore</b>.</>
+                              }
+                            </div>
                             <div className="mt-2 text-xs text-white/50">Hãy đảm bảo mặt đủ sáng, nhìn thẳng và ở trong khung hình.</div>
                           </>
                         ) : mode === "single" ? (
@@ -790,7 +933,7 @@ export default function Page() {
                         <div key={i} className={`w-2.5 h-2.5 rounded-full border border-white/20 shadow ${blinkStates[i] === "closed" ? "bg-red-500 shadow-red-500/30" : blinkStates[i] === "closing" ? "bg-amber-400 shadow-amber-400/30" : faceCount > i ? "bg-emerald-400 shadow-emerald-400/30" : "bg-white/20"}`} />
                       ))}
                     </div>
-                    <span className="text-[11px] px-2 py-1 rounded-full bg-black/50 border border-white/10 text-white/70">Gương lật • EAR 0.20 cố định</span>
+                    <span className="text-[11px] px-2 py-1 rounded-full bg-black/50 border border-white/10 text-white/70">Gương lật • EAR {adaptiveThresholdUI.toFixed(2)} auto</span>
                   </div>
                 </div>
 
@@ -856,7 +999,7 @@ export default function Page() {
                   <div className="mt-3 grid grid-cols-3 gap-2 text-center">
                     <div className="rounded-xl bg-black/30 border border-white/5 p-2.5">
                       <div className="text-[11px] text-white/50">NGƯỠNG</div>
-                      <div className="font-mono font-bold text-sm">0.20</div>
+                      <div className="font-mono font-bold text-sm">{adaptiveThresholdUI.toFixed(2)}</div>
                     </div>
                     <div className="rounded-xl bg-black/30 border border-white/5 p-2.5">
                       <div className="text-[11px] text-white/50">FPS</div>
@@ -921,7 +1064,29 @@ export default function Page() {
                         </div>
                       ))}
                     </div>
-                    <div className="mt-3 text-xs text-white/40">Ngưỡng 0.20 • Tự động lưu sau mỗi ván • Rời khung = lưu &amp; thua</div>
+                    <div className="mt-3 text-xs text-white/40">Ngưỡng {adaptiveThresholdUI.toFixed(2)} (auto 0.17-0.24) • Tự động lưu • Rời khung countdown cũng thua</div>
+                  </div>
+                )}
+
+                {mode === "single" && (
+                  <div className="rounded-[20px] border border-emerald-500/20 bg-emerald-500/[0.04] p-4">
+                    <div className="flex items-center justify-between">
+                      <h4 className="font-bold text-sm flex items-center gap-2"><span className="w-6 h-6 rounded-lg bg-emerald-500/20 flex items-center justify-center text-xs">🌍</span> Top 5 Global {globalLoading && <span className="text-xs text-white/40">...</span>}</h4>
+                      <button onClick={() => refreshGlobal(20, "top")} className="text-xs px-2.5 py-1 rounded-full bg-white/5 border border-white/10 hover:bg-white/10">↻</button>
+                    </div>
+                    <div className="mt-3 space-y-1.5 max-h-[180px] overflow-auto">
+                      {!supabaseReady ? <div className="text-xs text-amber-200 text-center py-4">Chưa cấu hình Supabase</div> : globalScoresFull.length===0 ? <div className="text-xs text-white/50 text-center py-6">Chưa có Global</div> : globalScoresFull.slice(0,5).map((h, idx) => {
+                        const isMe = h.player_name===playerName.trim();
+                        return (
+                          <div key={h.id} className={`flex items-center gap-2 text-sm p-2 rounded-xl border ${isMe?"bg-emerald-500/15 border-emerald-500/20":"bg-white/[0.04] border-white/5"}`}>
+                            <span className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${idx===0?"bg-amber-400 text-black":"bg-white/10"}`}>{idx+1}</span>
+                            <span className="flex-1 truncate flex items-center gap-1">{h.player_name} {isMe && <span className="text-[10px] px-1 rounded bg-emerald-500 text-white">YOU</span>}</span>
+                            <span className="font-mono text-emerald-300">{formatDuration(h.duration_ms)}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div className="mt-2 text-xs text-white/40">Global sync Supabase • tự hiệu chỉnh EAR {adaptiveThresholdUI.toFixed(2)}</div>
                   </div>
                 )}
 
@@ -941,7 +1106,7 @@ export default function Page() {
 
       <footer className="mt-auto border-t border-white/5 py-5 text-center text-xs text-white/30">
         <div className="max-w-6xl mx-auto px-4">
-          © 2026 Staredown • EAR cố định 0.20 • 60 FPS • MediaPipe 478 pts • v0.2.2 • build 2026-08-29-fix-loop
+          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60 FPS • MediaPipe 478 pts • v0.3.0 • build 2026-08-31-global
         </div>
       </footer>
     </div>

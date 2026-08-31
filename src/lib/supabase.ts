@@ -69,6 +69,25 @@ export async function fetchHighScores(limit = 10): Promise<HighScore[]> {
   return data as HighScore[];
 }
 
+export async function fetchRecentScores(limit = 10): Promise<HighScore[]> {
+  const client = getSupabase();
+  if (!client) return [];
+  const { data, error } = await client
+    .from("high_scores")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (error) {
+    console.warn("[Supabase] fetchRecentScores error", error.message);
+    return [];
+  }
+  return data as HighScore[];
+}
+
+export async function fetchGlobalLeaderboard(limit = 20, order: "top" | "recent" = "top"): Promise<HighScore[]> {
+  return order === "recent" ? fetchRecentScores(limit) : fetchHighScores(limit);
+}
+
 export async function submitHighScore(name: string, durationMs: number) {
   const client = getSupabase();
   if (!client) {
