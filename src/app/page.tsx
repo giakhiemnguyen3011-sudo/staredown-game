@@ -4,6 +4,7 @@ import { useFaceLandmarker } from "@/hooks/useFaceLandmarker";
 import { calcAvgEAR, EARSmoother, formatDuration, getAdaptiveThreshold, isEyeClosed } from "@/lib/ear";
 import { getSupabase, getSupabaseConfigError, fetchHighScores, submitHighScore, HighScore, fetchGlobalLeaderboard } from "@/lib/supabase";
 import EyeOverlay from "@/components/EyeOverlay";
+import { useOnline } from "@/hooks/useOnline";
 
 // ---------- Constants ----------
 const EAR_DEFAULT = 0.2; // fallback nếu chưa hiệu chỉnh
@@ -15,7 +16,7 @@ const COUNTDOWN_LOST_THRESHOLD = 4; // trong countdown chỉ cần 4 khung (~65m
 const AUTO_SAVE_MIN_MS = 500;
 
 // ---------- Types ----------
-type GameMode = "menu" | "single" | "multi";
+type GameMode = "menu" | "single" | "multi" | "online";
 type GamePhase = "idle" | "requesting" | "ready" | "countdown" | "playing" | "finished";
 type EndReason = "blink" | "tracking_lost" | null;
 
@@ -64,6 +65,13 @@ export default function Page() {
   const [globalLoading, setGlobalLoading] = useState(false);
   const [globalScoresFull, setGlobalScoresFull] = useState<HighScore[]>([]);
 
+  // Online (BETA) - Supabase Realtime LAN/Global
+  const online = useOnline(playerName);
+  const onlineRef = useRef(online);
+  useEffect(() => { onlineRef.current = online; }, [online]);
+  const [onlineFriendInput, setOnlineFriendInput] = useState("");
+  const [onlineCountdownSync, setOnlineCountdownSync] = useState<number | null>(null);
+
   // Video / MediaPipe
   const videoRef = useRef<HTMLVideoElement>(null);
   const rafRef = useRef<number>(0);
@@ -104,6 +112,9 @@ export default function Page() {
   const [adaptiveThresholdUI, setAdaptiveThresholdUI] = useState<number>(EAR_DEFAULT);
   // For countdown tracking lost
   const countdownTrackingLostRef = useRef(0);
+  // Online refs for fairness
+  const onlineBlinkTsRef = useRef<{ local: number | null; remote: number | null }>({ local: null, remote: null });
+  const onlineFinishedAtRef = useRef<number | null>(null);
 
   // Helpers for Global
   const refreshGlobal = useCallback(async (limit = 20, order: "top" | "recent" = "top") => {
@@ -223,6 +234,8 @@ export default function Page() {
       setLandmarksForOverlay([]);
       setEarValues([]);
       setFaceCount(0);
+      // Leave online room when back to menu
+      if (onlineRef.current.phase !== "idle") onlineRef.current.leaveRoom();
     } else {
       startCamera();
     }
@@ -262,6 +275,13 @@ export default function Page() {
   const triggerCountdown = useCallback(() => {
     if (!landmarkerReady) return;
     if (phase !== "ready" && phase !== "finished") return;
+    // Online mode: only host can trigger, via broadcast
+    if (modeRef.current === "online") {
+      if (online.role !== "host") return;
+      if (!online.opponent || !online.opponent.cameraReady || !online.selfCameraReady) return;
+      online.broadcastCountdownStart();
+      return;
+    }
     setCountdown(3);
     setPhase("countdown");
     setElapsedMs(0);
@@ -278,7 +298,106 @@ export default function Page() {
     calibrationSamplesRef.current = [];
     adaptiveThresholdRef.current = EAR_DEFAULT;
     setAdaptiveThresholdUI(EAR_DEFAULT);
+    onlineBlinkTsRef.current = { local: null, remote: null };
+    onlineFinishedAtRef.current = null;
   }, [landmarkerReady, phase]);
+
+  // Online event listeners (BETA) - sync countdown/blink/tracking
+  useEffect(() => {
+    if (mode !== "online") return;
+    const onCountdown = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { from: string; startAt: number };
+      // adjust countdown to be synced: startAt is when playing starts
+      const now = Date.now();
+      const delayToStart = detail.startAt - now;
+      // if delay ~3200, keep 3, else adjust
+      const initial = delayToStart > 2500 ? 3 : delayToStart > 1500 ? 2 : delayToStart > 500 ? 1 : 0;
+      setCountdown(initial);
+      setPhase("countdown");
+      setElapsedMs(0);
+      setWinner(null);
+      setEndReason(null);
+      setTrackingWarning(false);
+      trackingLostFramesRef.current = 0;
+      countdownTrackingLostRef.current = 0;
+      hasAutoSavedRef.current = false;
+      closedFramesRef.current = [0, 0];
+      openFramesRef.current = [0, 0];
+      smootherRefs.current.forEach(s => s.reset());
+      calibrationSamplesRef.current = [];
+      adaptiveThresholdRef.current = EAR_DEFAULT;
+      setAdaptiveThresholdUI(EAR_DEFAULT);
+      onlineBlinkTsRef.current = { local: null, remote: null };
+      onlineFinishedAtRef.current = null;
+      setOnlineCountdownSync(detail.startAt);
+      console.log("[online] countdown_start from", detail.from, "startAt", detail.startAt, "delay", delayToStart);
+    };
+    const onBlink = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { from: string; ts: number };
+      const curPhase = phaseRef.current as string;
+      // if we already finished, check for draw within window
+      if (curPhase === "finished") {
+        const now2 = Date.now();
+        const remoteTs2 = detail.ts;
+        const localTs2 = onlineBlinkTsRef.current.local;
+        const finishedAt = onlineFinishedAtRef.current ?? now2;
+        if (Math.abs(now2 - finishedAt) < 350 && localTs2 && Math.abs(localTs2 - remoteTs2) < 120) {
+          setWinner("draw" as unknown as 1 | 2 | "draw");
+          console.log("[online] blink draw after finish");
+        }
+        return;
+      }
+      if (curPhase !== "playing") return;
+      const now = Date.now();
+      const remoteTs = detail.ts;
+      const localTs = onlineBlinkTsRef.current.local;
+      onlineBlinkTsRef.current.remote = remoteTs;
+      // fairness: compensate ping
+      const ping = onlineRef.current.pingMs || 0;
+      const adjustedRemoteTs = remoteTs + ping / 2;
+      // if local also blinked recently, compare
+      if (localTs && Math.abs(localTs - remoteTs) < 150) {
+        // draw if close
+        setEndReason("blink");
+        setWinner("draw");
+        setPhase("finished");
+        onlineFinishedAtRef.current = now;
+        try { navigator.vibrate?.([80, 40, 80]); } catch {}
+        console.log("[online] blink draw", localTs, remoteTs);
+        return;
+      }
+      if (localTs && localTs < remoteTs) {
+        // local blinked earlier but remote arrived late - local already lost? This case handled below
+      }
+      // opponent blinked, local wins (opponent lost)
+      setEndReason("blink");
+      // guest/host winner mapping for online: winner is self, but we reuse 1/2 display as "Bạn thắng"
+      setWinner(1); // treat as self win
+      setPhase("finished");
+      onlineFinishedAtRef.current = now;
+      try { navigator.vibrate?.(120); } catch {}
+      console.log("[online] opponent blink, you win", remoteTs);
+    };
+    const onTrackingLost = (e: Event) => {
+      const detail = (e as CustomEvent).detail as { from: string; ts: number };
+      const curPhase2 = phaseRef.current as string;
+      if (curPhase2 === "finished") return;
+      if (curPhase2 !== "playing" && curPhase2 !== "countdown") return;
+      setEndReason("tracking_lost");
+      setWinner(1);
+      setPhase("finished");
+      onlineFinishedAtRef.current = Date.now();
+      console.log("[online] opponent tracking lost");
+    };
+    window.addEventListener("online:countdown_start", onCountdown as EventListener);
+    window.addEventListener("online:blink", onBlink as EventListener);
+    window.addEventListener("online:tracking_lost", onTrackingLost as EventListener);
+    return () => {
+      window.removeEventListener("online:countdown_start", onCountdown as EventListener);
+      window.removeEventListener("online:blink", onBlink as EventListener);
+      window.removeEventListener("online:tracking_lost", onTrackingLost as EventListener);
+    };
+  }, [mode]);
 
   // Timer tick while playing
   useEffect(() => {
@@ -353,6 +472,27 @@ export default function Page() {
 
     const handleBlinkDetected = (indices: number[]) => {
       if (phaseRef.current !== "playing") return;
+      if (modeRef.current === "online") {
+        const ts = Date.now();
+        onlineBlinkTsRef.current.local = ts;
+        onlineRef.current.broadcastBlink(ts);
+        // Check if remote already blinked very close -> draw
+        const remoteTs = onlineBlinkTsRef.current.remote;
+        if (remoteTs && Math.abs(ts - remoteTs) < 130) {
+          setEndReason("blink");
+          setWinner("draw");
+          setPhase("finished");
+          onlineFinishedAtRef.current = ts;
+          try { navigator.vibrate?.([80, 40, 80]); } catch {}
+          return;
+        }
+        setEndReason("blink");
+        setWinner(2); // you lost (opponent wins)
+        setPhase("finished");
+        onlineFinishedAtRef.current = ts;
+        try { navigator.vibrate?.(120); } catch {}
+        return;
+      }
       if (modeRef.current === "single") {
         setEndReason("blink");
         setPhase("finished");
@@ -370,16 +510,24 @@ export default function Page() {
 
     const handleTrackingLost = () => {
       if (phaseRef.current !== "playing") return;
+      if (modeRef.current === "online") {
+        const ts = Date.now();
+        onlineRef.current.broadcastTrackingLost(ts);
+      }
       setEndReason("tracking_lost");
+      if (modeRef.current === "online") setWinner(2);
       setPhase("finished");
       setTrackingWarning(false);
-      // lưu sẽ do effect auto-save xử lý (single). Với multi cũng set finished để hiện lỗi
       try { navigator.vibrate?.([100, 50, 100, 50]); } catch {}
     };
 
     const handleCountdownLost = () => {
       if (phaseRef.current !== "countdown") return;
       console.log("[countdown] user left camera -> abort");
+      if (modeRef.current === "online") {
+        onlineRef.current.broadcastTrackingLost(Date.now());
+        setWinner(2);
+      }
       setEndReason("tracking_lost");
       setPhase("finished");
       setTrackingWarning(false);
@@ -657,7 +805,7 @@ export default function Page() {
             </div>
 
             {/* Mode cards */}
-            <div className="grid md:grid-cols-2 gap-5">
+            <div className="grid md:grid-cols-3 gap-5">
               <button onClick={() => setMode("single")} className="group text-left relative overflow-hidden rounded-[24px] border border-white/10 bg-gradient-to-br from-indigo-600/25 via-violet-600/15 to-transparent backdrop-blur p-6 sm:p-7 hover:border-indigo-400/30 hover:from-indigo-600/30 transition">
                 <div className="absolute top-0 right-0 w-32 h-32 bg-indigo-500/20 blur-[40px] rounded-full group-hover:bg-indigo-500/30 transition" />
                 <div className="relative">
@@ -688,6 +836,24 @@ export default function Page() {
                   </ul>
                   <div className="mt-5 inline-flex items-center gap-2 px-5 py-2.5 rounded-full bg-white text-[#070a14] font-bold text-sm group-hover:translate-x-0.5 transition">
                     Đấu 2 người <span>→</span>
+                  </div>
+                </div>
+              </button>
+
+              <button onClick={() => setMode("online")} className="group text-left relative overflow-hidden rounded-[24px] border border-cyan-500/20 bg-gradient-to-br from-cyan-600/25 via-blue-600/15 to-transparent backdrop-blur p-6 sm:p-7 hover:border-cyan-400/30 hover:from-cyan-600/30 transition">
+                <div className="absolute top-3 right-3 px-2 py-1 rounded-full bg-amber-400 text-black text-[10px] font-black tracking-widest">BETA</div>
+                <div className="absolute top-0 right-0 w-32 h-32 bg-cyan-500/20 blur-[40px] rounded-full group-hover:bg-cyan-500/30 transition" />
+                <div className="relative">
+                  <div className="w-12 h-12 rounded-2xl bg-cyan-500 flex items-center justify-center text-xl shadow-lg shadow-cyan-500/20">🌐</div>
+                  <h3 className="mt-4 text-xl font-extrabold">Online Multiplayer <span className="text-xs font-bold px-2 py-1 rounded-full bg-amber-400 text-black ml-1">BETA</span></h3>
+                  <p className="text-sm text-white/65 mt-1">1vs1 qua mạng • Random matchmaking + Friend Code.</p>
+                  <ul className="mt-3 space-y-1.5 text-xs text-white/70">
+                    <li className="flex gap-2"><span className="text-emerald-400">✓</span> LAN / Global tối ưu ping</li>
+                    <li className="flex gap-2"><span className="text-emerald-400">✓</span> Friend code 6 ký tự</li>
+                    <li className="flex gap-2"><span className="text-emerald-400">✓</span> Đồng bộ camera & countdown</li>
+                  </ul>
+                  <div className="mt-5 inline-flex items-center gap-2 px-5 py-2.5 rounded-full bg-white text-[#070a14] font-bold text-sm group-hover:translate-x-0.5 transition">
+                    Chơi Online <span>→</span>
                   </div>
                 </div>
               </button>
@@ -1102,11 +1268,217 @@ export default function Page() {
             </div>
           </div>
         )}
+
+        {mode === "online" && (
+          <div className="space-y-5 animate-[fadeIn_0.3s]">
+            {/* Top bar online */}
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <button onClick={() => { online.leaveRoom(); setMode("menu"); }} className="inline-flex items-center gap-2 px-4 py-2 rounded-full bg-white/10 hover:bg-white/15 border border-white/10 text-sm transition">← Về menu</button>
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="px-2 py-1 rounded-full bg-cyan-500 text-white font-black text-[10px] tracking-widest">BETA</span>
+                <span className={`px-3 py-1.5 rounded-full border text-xs font-bold ${online.phase === "searching" ? "bg-amber-500 text-black border-amber-400 animate-pulse" : online.phase === "room" || online.phase === "matched" ? "bg-cyan-600 text-white border-cyan-400" : phase === "playing" ? "bg-emerald-500 text-white border-emerald-400 animate-pulse" : phase === "countdown" ? "bg-amber-500 text-black border-amber-400" : phase === "finished" ? "bg-red-500 text-white border-red-400" : "bg-white/10 border-white/10"}`}>
+                  {online.phase === "searching" ? `Đang tìm... ${online.searchingState}` : online.phase === "room" || online.phase === "matched" ? `Phòng ${online.roomCode}` : phase === "ready" ? "Sẵn sàng" : phase === "countdown" ? `Chuẩn bị ${countdown}` : phase === "playing" ? "● ONLINE LIVE" : phase === "finished" ? (endReason === "tracking_lost" ? "MẤT TRACK" : "Kết thúc") : "Chờ kết nối"}
+                </span>
+                <span className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-white/5 border border-white/10">
+                  <span className={`w-2 h-2 rounded-full ${faceCount > 0 ? "bg-emerald-400" : "bg-red-400 animate-pulse"}`} /> {faceCount} mặt • {fps} FPS
+                </span>
+                <span className={`hidden sm:inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full border text-xs font-mono ${online.pingMs > 0 && online.pingMs < 80 ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-200" : online.pingMs < 150 ? "bg-amber-500/15 border-amber-500/30 text-amber-200" : "bg-red-500/15 border-red-500/30 text-red-200"}`}>
+                  Ping {online.pingMs ? `${Math.round(online.pingMs)}ms` : "--"} {online.isConnected && online.roomCode ? `• ${online.netMode.toUpperCase()}` : ""}
+                </span>
+              </div>
+            </div>
+
+            {/* Online mode notice */}
+            <div className="rounded-[20px] border border-cyan-500/20 bg-cyan-500/10 p-3 flex flex-wrap gap-2 items-center justify-between text-xs">
+              <div className="flex items-center gap-2"><span className="px-2 py-1 rounded-full bg-amber-400 text-black font-black text-[11px]">BETA</span><span className="text-white/80">Online Multiplayer đang thử nghiệm — tối ưu LAN (WebRTC P2P) & Global (Supabase Realtime). Ping được bù để công bằng.</span></div>
+              <span className={`px-2.5 py-1 rounded-full text-xs font-bold border ${online.netMode === "lan" ? "bg-emerald-500 text-white border-emerald-400" : "bg-white/5 border-white/10"}`}>{online.netMode === "lan" ? "LAN: ~10-30ms" : "GLOBAL: ~50-120ms"} {online.isWebRTCReady ? "• P2P ✓" : online.netMode === "lan" ? "• Đang thử P2P..." : ""}</span>
+            </div>
+
+            <div className="grid lg:grid-cols-[1.45fr_0.85fr] gap-5">
+              {/* Video area reused */}
+              <div className="relative overflow-hidden rounded-[24px] border border-white/10 bg-black/60 backdrop-blur">
+                <div className="relative aspect-[16/10] bg-[#0a0f1e] overflow-hidden">
+                  <video ref={videoRef} playsInline muted autoPlay className="w-full h-full object-cover" style={{ transform: "scaleX(-1)" }} />
+                  {showDebug && faceCount > 0 && <EyeOverlay landmarks={landmarksForOverlay} videoWidth={videoSize.w} videoHeight={videoSize.h} blinkState={blinkStates} />}
+                  {phase === "playing" && <div className="absolute inset-0 pointer-events-none overflow-hidden opacity-20"><div className="absolute left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-[scanline_2s_linear_infinite]" /></div>}
+                  {trackingWarning && phase !== "finished" && (
+                    <div className="absolute top-12 left-3 right-3 flex justify-center pointer-events-none">
+                      <div className="px-3 py-2 rounded-xl bg-amber-500 text-black text-xs font-bold shadow-lg flex items-center gap-2 animate-pulse"><span>⚠️</span><span>{phase === "playing" ? "Mất tín hiệu — giữ mặt trong khung!" : "Không thấy mặt — vào camera, đủ sáng"}</span></div>
+                    </div>
+                  )}
+                  {phase === "countdown" && (
+                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/40 backdrop-blur-[2px]">
+                      <div className="text-[92px] sm:text-[120px] font-black leading-none tracking-tighter text-white drop-shadow-[0_8px_30px_rgba(6,182,212,0.6)] animate-[pulse-eye_0.9s_ease_infinite]">{countdown === 0 ? "GO!" : countdown}</div>
+                      <div className="text-sm tracking-[0.3em] text-white/70 mt-2">ONLINE • ĐỪNG CHỚP • PING {Math.round(online.pingMs || 0)}ms</div>
+                    </div>
+                  )}
+                  {phase === "finished" && (
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/55 backdrop-blur-sm p-4">
+                      <div className={`w-full max-w-md rounded-[20px] border backdrop-blur p-5 sm:p-6 text-center shadow-2xl ${endReason === "tracking_lost" ? "bg-red-950/90 border-red-500/30" : winner === 1 ? "bg-emerald-950/90 border-emerald-500/30" : winner === 2 ? "bg-red-950/90 border-red-500/30" : "bg-[#0f1220]/90 border-white/15"}`}>
+                        {endReason === "tracking_lost" ? (
+                          <>
+                            <div className="w-12 h-12 mx-auto rounded-2xl bg-red-500 flex items-center justify-center text-xl">⚠️</div>
+                            <div className="mt-3 text-xs tracking-[0.2em] text-red-300">MẤT TÍN HIỆU</div>
+                            <div className="mt-1 font-black text-xl leading-tight">{elapsedMs < 500 ? "RỜI KHUNG KHI ĐẾM NGƯỢC" : "ĐỐI THỦ / BẠN RỜI KHUNG"}</div>
+                            <div className="mt-2 text-sm text-white/70">{winner === 1 ? "Đối thủ rời khung — bạn thắng!" : winner === 2 ? "Bạn rời khung — bạn thua!" : "Mất kết nối camera."}</div>
+                            <div className="mt-1 font-mono text-white/80">{formatDuration(Math.round(elapsedMs))} • Ping {Math.round(online.pingMs)}ms</div>
+                          </>
+                        ) : (
+                          <>
+                            <div className="text-4xl">{winner === 1 ? "🏆" : winner === 2 ? "😵" : winner === "draw" ? "🤝" : "👁️"}</div>
+                            <div className="mt-2 font-black text-2xl">{winner === 1 ? "BẠN THẮNG!" : winner === 2 ? "BẠN THUA!" : winner === "draw" ? "HÒA!" : "KẾT THÚC"}</div>
+                            <div className="text-sm text-white/60 mt-1">{winner === 1 ? "Đối thủ đã chớp trước" : winner === 2 ? "Bạn đã chớp trước" : winner === "draw" ? "Cả hai chớp cùng lúc!" : `Thời gian ${formatDuration(Math.round(elapsedMs))}`}</div>
+                            <div className="mt-1 font-mono text-white/80">{formatDuration(Math.round(elapsedMs))} • Ping {Math.round(online.pingMs)}ms {online.isWebRTCReady ? "• P2P" : ""}</div>
+                            {online.opponent && <div className="text-xs text-white/50 mt-1">vs {online.opponent.name} ({online.opponent.friendCode})</div>}
+                          </>
+                        )}
+                        <div className="mt-5 grid grid-cols-2 gap-2.5">
+                          <button onClick={() => { setPhase("ready"); setWinner(null); setEndReason(null); onlineBlinkTsRef.current = { local: null, remote: null }; }} className="py-2.5 rounded-full bg-white text-black font-bold text-sm hover:bg-zinc-100">Sẵn sàng lại</button>
+                          <button onClick={() => { online.leaveRoom(); setMode("menu"); }} className="py-2.5 rounded-full bg-white/10 border border-white/15 font-bold text-sm hover:bg-white/15">Rời phòng</button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                  {phase === "ready" && online.phase !== "room" && online.phase !== "matched" && (
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+                      <div className="text-center text-white/80 text-sm">Vào phòng hoặc tìm trận để bắt đầu<br/><span className="text-xs text-white/50">Camera đã sẵn sàng • EAR {adaptiveThresholdUI.toFixed(2)}</span></div>
+                    </div>
+                  )}
+                  <div className="absolute top-3 left-3 right-3 flex items-center justify-between gap-2 pointer-events-none">
+                    <div className="flex items-center gap-2">
+                      <span className={`px-2.5 py-1 rounded-full backdrop-blur border text-xs font-mono ${faceCount === 0 ? "bg-red-500/90 border-red-400 text-white animate-pulse" : "bg-black/55 border-white/15"}`}>{faceCount === 0 ? "Không thấy mặt" : `${faceCount} mặt`}</span>
+                      {phase === "playing" && <span className="hidden sm:inline-flex px-2.5 py-1 rounded-full bg-cyan-500/90 text-white text-xs font-bold">● ONLINE {online.netMode.toUpperCase()} • {Math.round(online.pingMs)}ms</span>}
+                    </div>
+                    <div className="hidden sm:flex items-center gap-1.5 text-xs">
+                      {earValues.map((ear, i) => (
+                        <span key={i} className={`px-2.5 py-1 rounded-full border font-mono backdrop-blur ${blinkStates[i] === "closed" ? "bg-red-500 text-white border-red-400" : blinkStates[i] === "closing" ? "bg-amber-500 text-black border-amber-400" : "bg-black/55 border-white/15"}`}>P{i + 1}: {ear.toFixed(2)} {blinkStates[i] === "closed" ? "• CLOSED" : "• OPEN"}</span>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between">
+                    <div className="flex gap-1.5">{Array.from({ length: 1 }).map((_, i) => (<div key={i} className={`w-2.5 h-2.5 rounded-full border border-white/20 shadow ${blinkStates[i] === "closed" ? "bg-red-500 shadow-red-500/30" : blinkStates[i] === "closing" ? "bg-amber-400" : faceCount > i ? "bg-emerald-400" : "bg-white/20"}`} />))}</div>
+                    <span className="text-[11px] px-2 py-1 rounded-full bg-black/50 border border-white/10 text-white/70">BETA • Ping bù desync • EAR {adaptiveThresholdUI.toFixed(2)}</span>
+                  </div>
+                </div>
+                <div className="p-4 sm:p-5 bg-gradient-to-b from-transparent to-white/[0.03] border-t border-white/10 flex flex-wrap gap-2.5 items-center justify-between">
+                  <div className="flex flex-wrap gap-2.5">
+                    {phase === "ready" && online.phase === "room" && (
+                      <>
+                        <button onClick={() => online.updateCameraReady(!online.selfCameraReady)} className={`px-5 py-2.5 rounded-full font-bold text-sm transition border ${online.selfCameraReady ? "bg-emerald-500 text-white border-emerald-400" : "bg-white/10 border-white/15 hover:bg-white/15"}`}>{online.selfCameraReady ? "✓ Đã sẵn sàng" : "○ Sẵn sàng Camera"}</button>
+                        {online.role === "host" && <button onClick={triggerCountdown} disabled={!online.opponent || !online.opponent.cameraReady || !online.selfCameraReady} className="px-6 py-2.5 rounded-full bg-gradient-to-r from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 disabled:opacity-40 disabled:cursor-not-allowed font-bold text-sm shadow-lg shadow-cyan-600/20 transition">▶ Bắt đầu Online {(!online.opponent || !online.opponent.cameraReady) ? "(chờ đối thủ)" : ""}</button>}
+                        {online.role === "guest" && <span className="px-4 py-2.5 rounded-full bg-white/5 border border-white/10 text-sm text-white/60">Chờ host bắt đầu...</span>}
+                      </>
+                    )}
+                    {phase === "playing" && <button onClick={() => { setEndReason("blink"); setWinner(2); setPhase("finished"); }} className="px-5 py-2.5 rounded-full bg-white/10 hover:bg-white/15 border border-white/15 text-sm font-semibold">Dừng</button>}
+                    {phase === "finished" && <button onClick={() => { setPhase("ready"); setWinner(null); setEndReason(null); onlineBlinkTsRef.current = { local: null, remote: null }; }} className="px-6 py-2.5 rounded-full bg-white text-black font-bold text-sm hover:bg-zinc-100">↻ Sẵn sàng lại</button>}
+                    {online.phase === "room" && <button onClick={() => online.leaveRoom()} className="px-4 py-2.5 rounded-full bg-red-500/20 hover:bg-red-500/30 border border-red-500/30 text-sm">✕ Rời phòng</button>}
+                    <button onClick={() => { stopCamera(); setTimeout(() => startCamera(), 250); }} className="px-4 py-2.5 rounded-full bg-white/5 hover:bg-white/10 border border-white/10 text-sm">↻ Reload cam</button>
+                  </div>
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className={`px-2.5 py-1 rounded-full border text-xs font-mono ${online.pingMs < 80 ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-200" : online.pingMs < 150 ? "bg-amber-500/15 border-amber-500/30 text-amber-200" : "bg-red-500/15 border-red-500/30 text-red-200"}`}>Ping {Math.round(online.pingMs) || "--"}ms</span>
+                    <label className="flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/5 border border-white/10"><input type="checkbox" checked={showDebug} onChange={e => setShowDebug(e.target.checked)} className="accent-cyan-500" /> Debug</label>
+                  </div>
+                </div>
+                {cameraError && <div className="mx-4 mb-4 p-3 rounded-xl bg-red-500/10 border border-red-500/20 text-sm text-red-200 flex gap-2"><span>⚠️</span> <span>{cameraError}</span></div>}
+                {lmState.status === "error" && <div className="mx-4 mb-4 p-3 rounded-xl bg-amber-500/10 border border-amber-500/20 text-sm text-amber-200">{lmState.message}</div>}
+              </div>
+
+              {/* Right panel - Online Lobby */}
+              <div className="space-y-4">
+                <div className="rounded-[24px] border border-white/10 bg-gradient-to-br from-white/[0.06] to-white/[0.02] backdrop-blur p-5 sm:p-6">
+                  <div className="flex items-center justify-between">
+                    <div className="text-xs tracking-[0.18em] text-white/50 font-semibold">ONLINE LOBBY • BETA</div>
+                    <div className={`w-2 h-2 rounded-full ${online.isConnected ? "bg-emerald-400 animate-pulse shadow shadow-emerald-400/50" : "bg-white/20"}`} />
+                  </div>
+                  <div className="mt-3">
+                    <div className="text-xs text-white/50">Tài khoản</div>
+                    <div className="mt-1 flex gap-2">
+                      <input value={playerName} onChange={e => setPlayerName(e.target.value)} placeholder="Tên bạn (xác nhận)" maxLength={18} className="flex-1 px-3 py-2 rounded-xl bg-white/5 border border-white/10 focus:border-cyan-400 outline-none text-sm" />
+                      <span className="px-3 py-2 rounded-xl bg-cyan-500/15 border border-cyan-500/20 text-xs font-mono self-center">{online.friendCode}</span>
+                    </div>
+                    <div className="mt-2 flex gap-2 text-xs">
+                      <button onClick={() => { const c = online.regenerateCode(); setOnlineFriendInput(c); }} className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 hover:bg-white/10">↻ Đổi mã</button>
+                      <button onClick={() => { navigator.clipboard?.writeText(online.friendCode); }} className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 hover:bg-white/10">⎘ Copy mã</button>
+                      <span className="self-center text-white/40">Mã bạn bè của bạn</span>
+                    </div>
+                  </div>
+
+                  <div className="mt-4 grid grid-cols-2 gap-2">
+                    <button onClick={() => online.setNetMode("global")} className={`py-2 rounded-xl border text-xs font-bold transition ${online.netMode === "global" ? "bg-cyan-500 text-white border-cyan-400" : "bg-white/5 border-white/10 text-white/70"}`}>🌍 Global</button>
+                    <button onClick={() => online.setNetMode("lan")} className={`py-2 rounded-xl border text-xs font-bold transition ${online.netMode === "lan" ? "bg-emerald-500 text-white border-emerald-400" : "bg-white/5 border-white/10 text-white/70"}`}>🏠 LAN</button>
+                  </div>
+                  <div className="text-xs text-white/40 mt-1">{online.netMode === "lan" ? "LAN: ưu tiên WebRTC P2P (~10-30ms), nếu thất bại fallback Supabase" : "Global: Supabase Realtime (~50-120ms) + bù ping"}</div>
+
+                  <div className="mt-4 space-y-2">
+                    {online.phase === "idle" || online.phase === "searching" ? (
+                      <>
+                        <button onClick={() => online.phase === "searching" ? online.cancelMatchmaking() : online.startRandomMatchmaking(online.netMode)} className={`w-full py-3 rounded-xl font-black text-sm transition ${online.phase === "searching" ? "bg-amber-500 text-black" : "bg-gradient-to-r from-cyan-600 to-blue-600 text-white hover:from-cyan-500 hover:to-blue-500"}`}>
+                          {online.phase === "searching" ? `✕ Hủy tìm • ${online.searchingState}` : `🎲 Random Matchmaking (${online.netMode.toUpperCase()})`}
+                        </button>
+                        {online.errorMsg && <div className="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/20 rounded-xl p-2">{online.errorMsg}</div>}
+                      </>
+                    ) : (
+                      <div className="p-3 rounded-xl bg-white/5 border border-white/10 text-sm">
+                        <div className="font-bold">Phòng: <span className="font-mono text-cyan-300">{online.roomCode}</span> • {online.role === "host" ? "Host" : "Guest"} • {online.netMode.toUpperCase()} {online.isWebRTCReady ? "• P2P ✓" : ""}</div>
+                        <div className="text-xs text-white/60 mt-1">{online.searchingState || (online.opponent ? `vs ${online.opponent.name}` : "Chờ đối thủ...")}</div>
+                        <button onClick={() => online.leaveRoom()} className="mt-2 w-full py-2 rounded-full bg-red-500/15 border border-red-500/20 text-red-200 text-xs font-bold hover:bg-red-500/20">✕ Rời phòng</button>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="mt-3 p-3 rounded-xl bg-white/5 border border-white/10">
+                    <div className="text-xs font-bold text-white/70">Friend Code</div>
+                    <div className="mt-1 flex gap-2">
+                      <input value={onlineFriendInput} onChange={e => setOnlineFriendInput(e.target.value.toUpperCase())} placeholder="Nhập mã bạn bè (ví dụ ABCD12)" maxLength={8} className="flex-1 px-3 py-2 rounded-xl bg-black/30 border border-white/10 focus:border-cyan-400 outline-none font-mono text-sm uppercase" />
+                      <button onClick={() => online.createFriendRoom()} className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 text-xs font-bold hover:bg-white/15">Tạo</button>
+                      <button onClick={() => { if (onlineFriendInput.trim()) online.joinFriendRoom(onlineFriendInput); }} className="px-3 py-2 rounded-xl bg-cyan-500 text-white text-xs font-bold hover:bg-cyan-400">Vào</button>
+                    </div>
+                    <div className="text-xs text-white/40 mt-1">Tạo phòng dùng mã của bạn, hoặc nhập mã bạn bè để vào. Đảm bảo cả hai đã sẵn sàng camera.</div>
+                  </div>
+                </div>
+
+                <div className="rounded-[20px] border border-cyan-500/20 bg-cyan-500/[0.04] p-4">
+                  <h4 className="font-bold text-sm flex items-center gap-2"><span className="w-6 h-6 rounded-lg bg-cyan-500/20 flex items-center justify-center text-xs">👥</span> Đối thủ {online.opponent ? <span className="text-emerald-300">• Đã kết nối</span> : <span className="text-white/40">• Chưa có</span>}</h4>
+                  {online.opponent ? (
+                    <div className="mt-3 space-y-2">
+                      <div className="flex items-center gap-3 p-2.5 rounded-xl bg-white/5 border border-white/5">
+                        <div className="w-10 h-10 rounded-xl bg-white text-black flex items-center justify-center font-black">{online.opponent.name.slice(0,1).toUpperCase()}</div>
+                        <div className="flex-1">
+                          <div className="font-bold text-sm">{online.opponent.name}</div>
+                          <div className="text-xs text-white/50 font-mono">{online.opponent.friendCode}</div>
+                        </div>
+                        <span className={`px-2.5 py-1 rounded-full text-xs font-bold border ${online.opponent.cameraReady ? "bg-emerald-500 text-white border-emerald-400" : "bg-amber-500/20 text-amber-200 border-amber-500/30"}`}>{online.opponent.cameraReady ? "✓ Sẵn sàng" : "○ Chưa"}</span>
+                      </div>
+                      <div className="grid grid-cols-3 gap-2 text-center">
+                        <div className="rounded-xl bg-black/30 border border-white/5 p-2.5"><div className="text-[11px] text-white/50">PING BẠN</div><div className="font-mono font-bold text-sm text-cyan-300">{Math.round(online.pingMs) || "--"}ms</div></div>
+                        <div className="rounded-xl bg-black/30 border border-white/5 p-2.5"><div className="text-[11px] text-white/50">PING ĐỐI THỦ</div><div className="font-mono font-bold text-sm text-cyan-300">{Math.round(online.opponentPingMs) || "--"}ms</div></div>
+                        <div className="rounded-xl bg-black/30 border border-white/5 p-2.5"><div className="text-[11px] text-white/50">CHẾ ĐỘ</div><div className="font-bold text-sm">{online.netMode.toUpperCase()} {online.isWebRTCReady ? "P2P" : ""}</div></div>
+                      </div>
+                      <div className="text-xs text-white/40">Đảm bảo cả hai camera đã sẵn sàng (thấy mặt) mới bắt đầu được. Ping được bù để chống desync.</div>
+                    </div>
+                  ) : (
+                    <div className="mt-3 text-xs text-white/50 text-center py-6 border border-dashed border-white/10 rounded-xl">Chưa có đối thủ — dùng Random hoặc Friend Code để ghép.</div>
+                  )}
+                </div>
+
+                <div className="rounded-[20px] border border-amber-500/20 bg-amber-500/10 p-4">
+                  <div className="text-xs font-bold tracking-widest text-amber-200">BETA • TỐI ƯU MẠNG</div>
+                  <ul className="mt-2 space-y-1.5 text-xs text-white/70 leading-relaxed">
+                    <li>• LAN: thử WebRTC P2P trực tiếp, nếu không được fallback Supabase, ping ~10-30ms</li>
+                    <li>• Global: Supabase Realtime Broadcast, ping ~50-120ms, bù ½ RTT để công bằng</li>
+                    <li>• Đếm ngược & chớp được đồng bộ bằng timestamp, nếu lệch &lt;120ms tính hòa</li>
+                    <li>• Camera cả hai phải sẵn sàng (thấy mặt) mới cho phép Start — tránh lệch trạng thái</li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </main>
 
       <footer className="mt-auto border-t border-white/5 py-5 text-center text-xs text-white/30">
         <div className="max-w-6xl mx-auto px-4">
-          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60 FPS • MediaPipe 478 pts • v0.3.0 • build 2026-08-31-global
+          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60 FPS • MediaPipe 478 pts • v0.4.0-beta • Online BETA • build 2026-08-31-online
         </div>
       </footer>
     </div>
