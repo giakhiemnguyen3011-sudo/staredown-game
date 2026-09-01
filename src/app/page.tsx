@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useFaceLandmarker } from "@/hooks/useFaceLandmarker";
 import { calcAvgEAR, EARSmoother, formatDuration, getAdaptiveThreshold, isEyeClosed, isEyeClosedQuick } from "@/lib/ear";
-import { getSupabase, getSupabaseConfigError, submitHighScore, HighScore, fetchGlobalLeaderboard, deleteMyGlobalScores } from "@/lib/supabase";
+import { getSupabase, getSupabaseConfigError, submitHighScore, HighScore, deleteMyGlobalScores, getWeeklyRangeLabel } from "@/lib/supabase";
 import EyeOverlay from "@/components/EyeOverlay";
 import { useOnline } from "@/hooks/useOnline";
 import ThemePicker from "@/components/ThemePicker";
@@ -62,8 +62,8 @@ export default function Page() {
   const [saveStatus, setSaveStatus] = useState<null | "saving" | "success" | "error">(null);
   const [saveErrorMsg, setSaveErrorMsg] = useState<string | null>(null);
   const [trackingWarning, setTrackingWarning] = useState(false);
-  // Global Highscore UI
-  const [globalTab, setGlobalTab] = useState<"top10" | "recent">("top10");
+  // Global Highscore UI - All-time top 10 vs Weekly top 50 (reset Monday)
+  const [globalTab, setGlobalTab] = useState<"alltime" | "weekly">("alltime");
   const [globalLoading, setGlobalLoading] = useState(false);
   const [globalScoresFull, setGlobalScoresFull] = useState<HighScore[]>([]);
 
@@ -144,21 +144,29 @@ export default function Page() {
   const onlineBlinkTsRef = useRef<{ local: number | null; remote: number | null }>({ local: null, remote: null });
   const onlineFinishedAtRef = useRef<number | null>(null);
 
-  // Helpers for Global
-  const refreshGlobal = useCallback(async (limit = 20, order: "top" | "recent" = "top") => {
+  // Helpers for Global - All-time top 10 vs Weekly top 50 (Monday reset)
+  const refreshGlobal = useCallback(async () => {
     setGlobalLoading(true);
     try {
-      const data = await fetchGlobalLeaderboard(limit, order);
-      if (order === "top") setHighScores(data.slice(0, 10));
-      setGlobalScoresFull(data);
+      const { fetchAllTimeTop10, fetchWeeklyTop50 } = await import("@/lib/supabase");
+      if (globalTab === "alltime") {
+        const data = await fetchAllTimeTop10();
+        setHighScores(data.slice(0, 10));
+        setGlobalScoresFull(data);
+      } else {
+        const data = await fetchWeeklyTop50();
+        setGlobalScoresFull(data);
+        // Keep highScores (top 3 in local panel) as All-time for reference
+        fetchAllTimeTop10().then(d => setHighScores(d.slice(0, 10))).catch(() => {});
+      }
     } catch (e) {
       console.warn("refreshGlobal failed", e);
     } finally { setGlobalLoading(false); }
-  }, []);
+  }, [globalTab]);
 
   // Refetch when tab changes
   useEffect(() => {
-    refreshGlobal(globalTab === "recent" ? 15 : 20, globalTab === "recent" ? "recent" : "top");
+    refreshGlobal();
   }, [globalTab, refreshGlobal]);
 
   // Delete Global (by client_id, robust to name change)
@@ -172,9 +180,9 @@ export default function Page() {
       alert(`Lỗi xóa: ${res.error}`);
     } else {
       alert(`Đã xóa ${res.deletedCount} bản ghi Global của máy này.` + (res.deletedCount === 0 ? " (không có bản ghi nào thuộc máy này)" : ""));
-      refreshGlobal(20, globalTab === "recent" ? "recent" : "top");
+      refreshGlobal();
     }
-  }, [refreshGlobal, globalTab]);
+  }, [refreshGlobal]);
 
   // Load local data
   useEffect(() => {
@@ -184,7 +192,7 @@ export default function Page() {
     const cfgErr = getSupabaseConfigError();
     setSupabaseError(cfgErr);
     setSupabaseReady(!!getSupabase() && !cfgErr);
-    refreshGlobal(20);
+    refreshGlobal();
     const best = loadLocalScores()[0]?.durationMs ?? 0;
     setBestSingleMs(best);
   }, [refreshGlobal]);
@@ -481,7 +489,7 @@ export default function Page() {
     if (getSupabase()) {
       submitHighScore(entry.name, dur).then(async (res) => {
         if (!res.error) {
-          await refreshGlobal(20);
+          await refreshGlobal();
           setSaveStatus("success");
           setSupabaseError(null);
         } else {
@@ -914,14 +922,19 @@ export default function Page() {
                 <h4 className="font-black flex items-center gap-2 text-sm tracking-widest text-emerald-200"><span className="w-7 h-7 rounded-lg bg-emerald-500/20 flex items-center justify-center">🌍</span> GLOBAL HIGHSCORE</h4>
                 <div className="flex items-center gap-2">
                   <div className="flex p-1 rounded-full bg-white/5 border border-white/10">
-                    <button onClick={() => setGlobalTab("top10")} className={`px-3 py-1 rounded-full text-xs font-bold transition ${globalTab === "top10" ? "bg-emerald-500 text-white shadow" : "text-white/60 hover:text-white"}`}>Top</button>
-                    <button onClick={() => setGlobalTab("recent")} className={`px-3 py-1 rounded-full text-xs font-bold transition ${globalTab === "recent" ? "bg-emerald-500 text-white shadow" : "text-white/60 hover:text-white"}`}>Mới nhất</button>
+                    <button onClick={() => setGlobalTab("alltime")} className={`px-3 py-1 rounded-full text-xs font-bold transition ${globalTab === "alltime" ? "bg-emerald-500 text-white shadow" : "text-white/60 hover:text-white"}`}>All-time Top 10</button>
+                    <button onClick={() => setGlobalTab("weekly")} className={`px-3 py-1 rounded-full text-xs font-bold transition ${globalTab === "weekly" ? "bg-emerald-500 text-white shadow" : "text-white/60 hover:text-white"}`}>Weekly Top 50</button>
                   </div>
-                  <button onClick={() => refreshGlobal(globalTab === "recent" ? 15 : 20, globalTab === "recent" ? "recent" : "top")} disabled={globalLoading} className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-xs hover:bg-white/10 disabled:opacity-50">↻ {globalLoading ? "..." : "Làm mới"}</button>
+                  <button onClick={() => refreshGlobal()} disabled={globalLoading} className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-xs hover:bg-white/10 disabled:opacity-50">↻ {globalLoading ? "..." : "Làm mới"}</button>
                   <button onClick={handleDeleteMyGlobal} disabled={deleteGlobalLoading || !supabaseReady} title="Xóa tất cả điểm Global của máy này (theo client_id, không phụ thuộc tên)" className="px-3 py-1.5 rounded-full bg-red-500/15 border border-red-500/30 text-red-200 text-xs hover:bg-red-500/25 disabled:opacity-50">🗑 {deleteGlobalLoading ? "..." : "Xóa của tôi"}</button>
                 </div>
               </div>
-              <div className="mt-1 text-xs text-white/50">Lưu vào Supabase • {supabaseReady ? `sẵn sàng • ${globalScoresFull.length} bản ghi` : supabaseError ?? "chưa cấu hình"} • Tên: <b className="text-white">{playerName}</b> • <span className="text-white/30">Client: {clientIdShort ? `${clientIdShort}…` : "…"}</span></div>
+              <div className="mt-1 text-xs text-white/50">
+                Lưu vào Supabase • {supabaseReady ? `sẵn sàng • ${globalScoresFull.length} bản ghi` : supabaseError ?? "chưa cấu hình"} • Tên: <b className="text-white">{playerName}</b> • <span className="text-white/30">Client: {clientIdShort ? `${clientIdShort}…` : "…"}</span>
+                <span className="ml-2 px-2 py-0.5 rounded-full text-[11px] border" style={{ borderColor: currentTheme.border, background: globalTab === "weekly" ? "rgba(16,185,129,0.15)" : "rgba(99,102,241,0.15)", color: globalTab === "weekly" ? "#6ee7b7" : "#a5b4fc" }}>
+                  {globalTab === "alltime" ? "All-time • từ 01/09/2026" : `Weekly • ${getWeeklyRangeLabel()} • reset T2`}
+                </span>
+              </div>
               <div className="mt-4">
                 {globalLoading ? (
                   <div className="py-8 text-center text-sm text-white/50">Đang tải bảng xếp hạng toàn cầu...</div>
@@ -1301,7 +1314,7 @@ export default function Page() {
                   <div className="rounded-[20px] border border-emerald-500/20 bg-emerald-500/[0.04] p-4">
                     <div className="flex items-center justify-between">
                       <h4 className="font-bold text-sm flex items-center gap-2"><span className="w-6 h-6 rounded-lg bg-emerald-500/20 flex items-center justify-center text-xs">🌍</span> Top 5 Global {globalLoading && <span className="text-xs text-white/40">...</span>}</h4>
-                      <button onClick={() => refreshGlobal(20, "top")} className="text-xs px-2.5 py-1 rounded-full bg-white/5 border border-white/10 hover:bg-white/10">↻</button>
+                      <button onClick={() => refreshGlobal()} className="text-xs px-2.5 py-1 rounded-full bg-white/5 border border-white/10 hover:bg-white/10">↻</button>
                     </div>
                     <div className="mt-3 space-y-1.5 max-h-[180px] overflow-auto">
                       {!supabaseReady ? <div className="text-xs text-amber-200 text-center py-4">Chưa cấu hình Supabase</div> : globalScoresFull.length===0 ? <div className="text-xs text-white/50 text-center py-6">Chưa có Global</div> : globalScoresFull.slice(0,5).map((h, idx) => {
@@ -1578,7 +1591,7 @@ export default function Page() {
 
       <footer className="mt-auto border-t border-white/5 py-5 text-center text-xs text-white/30">
         <div className="max-w-6xl mx-auto px-4">
-          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60 FPS • MediaPipe 478 pts • v0.5.1 • Quick-blink fix • build 2026-09-01
+          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60 FPS • MediaPipe 478 pts • v0.6.0 • All-time/Weekly • build 2026-09-01
         </div>
       </footer>
     </div>

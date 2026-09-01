@@ -115,6 +115,47 @@ export async function fetchGlobalLeaderboard(limit = 20, order: "top" | "recent"
   return order === "recent" ? fetchRecentScores(limit) : fetchHighScores(limit);
 }
 
+// --- New: All-time vs Weekly split (patch 2026-09-01) ---
+export function getWeeklyStartISO(): string {
+  const now = new Date();
+  const day = now.getDay(); // 0 Sun, 1 Mon ... 6 Sat
+  const diff = day === 0 ? -6 : 1 - day; // days to Monday
+  const monday = new Date(now);
+  monday.setDate(now.getDate() + diff);
+  monday.setHours(0, 0, 0, 0);
+  return monday.toISOString();
+}
+
+export function getWeeklyRangeLabel(): string {
+  const start = new Date(getWeeklyStartISO());
+  const end = new Date(start);
+  end.setDate(start.getDate() + 6);
+  end.setHours(23, 59, 59, 999);
+  const fmt = (d: Date) => d.toLocaleDateString("vi-VN", { day: "2-digit", month: "2-digit" });
+  return `${fmt(start)} - ${fmt(end)}`;
+}
+
+export async function fetchAllTimeTop10(): Promise<HighScore[]> {
+  return fetchHighScores(10);
+}
+
+export async function fetchWeeklyTop50(): Promise<HighScore[]> {
+  const client = getSupabase();
+  if (!client) return [];
+  const mondayISO = getWeeklyStartISO();
+  const { data, error } = await client
+    .from("high_scores")
+    .select("*")
+    .gte("created_at", mondayISO)
+    .order("duration_ms", { ascending: false })
+    .limit(50);
+  if (error) {
+    console.warn("[Supabase] fetchWeeklyTop50 error", error.message, error);
+    return [];
+  }
+  return data as HighScore[];
+}
+
 export async function submitHighScore(name: string, durationMs: number) {
   const client = getSupabase();
   if (!client) {
