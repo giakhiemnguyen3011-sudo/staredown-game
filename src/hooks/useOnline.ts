@@ -34,8 +34,13 @@ type _MatchmakingEvent =
   | { type: "match_accept"; from: string; to: string; roomCode: string };
 
 export function useOnline(playerName: string) {
-  const [account, setAccount] = useState(() => getOrCreateAccount());
-  const [friendCode, setFriendCode] = useState(() => account.friendCode);
+  const [account, setAccount] = useState(() => ({ id: "ssr", friendCode: "XXXXXX" }));
+  const [friendCode, setFriendCode] = useState("XXXXXX");
+  useEffect(() => {
+    const acc = getOrCreateAccount();
+    setAccount(acc);
+    setFriendCode(acc.friendCode);
+  }, []);
   const [netMode, setNetMode] = useState<OnlineNetMode>("global");
   const [phase, setPhase] = useState<OnlinePhase>("idle");
   const [roomCode, setRoomCode] = useState<string | null>(null);

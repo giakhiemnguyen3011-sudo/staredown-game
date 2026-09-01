@@ -75,13 +75,22 @@ export default function Page() {
   const [_onlineCountdownSync, setOnlineCountdownSync] = useState<number | null>(null);
   const [onlineLobbyTab, setOnlineLobbyTab] = useState<"public" | "all">("public");
 
-  // Theme
-  const [currentTheme, setCurrentTheme] = useState<ThemePreset>(() => getCurrentTheme());
+  // Theme - avoid hydration mismatch (server always midnight, client hydrates then loads stored)
+  const [currentTheme, setCurrentTheme] = useState<ThemePreset>(() => {
+    // Use first theme as SSR fallback to match server
+    try {
+      const { THEMES: _t } = require("@/lib/theme");
+      return _t[0];
+    } catch { return { id: "midnight", name: "Midnight", bg: "#070a14", card: "rgba(255,255,255,0.04)", border: "rgba(255,255,255,0.10)", accent: "#6366f1", accent2: "#8b5cf6", glow1: "rgba(99,102,241,0.20)", glow2: "rgba(6,182,212,0.15)", textAccent: "#a5b4fc" } as ThemePreset; }
+  });
+  const [clientIdShort, setClientIdShort] = useState("");
   useEffect(() => {
     const upd = () => setCurrentTheme(getCurrentTheme());
+    upd();
     window.addEventListener("theme-change", upd);
     window.addEventListener("storage", upd);
-    upd();
+    // Load client id for display (avoid hydration mismatch)
+    try { setClientIdShort((localStorage.getItem("staredown_account_id_v1") || "").slice(0, 6)); } catch {}
     return () => { window.removeEventListener("theme-change", upd); window.removeEventListener("storage", upd); };
   }, []);
 
@@ -906,7 +915,7 @@ export default function Page() {
                   <button onClick={handleDeleteMyGlobal} disabled={deleteGlobalLoading || !supabaseReady} title="Xóa tất cả điểm Global của máy này (theo client_id, không phụ thuộc tên)" className="px-3 py-1.5 rounded-full bg-red-500/15 border border-red-500/30 text-red-200 text-xs hover:bg-red-500/25 disabled:opacity-50">🗑 {deleteGlobalLoading ? "..." : "Xóa của tôi"}</button>
                 </div>
               </div>
-              <div className="mt-1 text-xs text-white/50">Lưu vào Supabase • {supabaseReady ? `sẵn sàng • ${globalScoresFull.length} bản ghi` : supabaseError ?? "chưa cấu hình"} • Tên: <b className="text-white">{playerName}</b> • <span className="text-white/30">Client: {typeof window !== "undefined" ? (localStorage.getItem("staredown_account_id_v1") || "").slice(0,6) : ""}…</span></div>
+              <div className="mt-1 text-xs text-white/50">Lưu vào Supabase • {supabaseReady ? `sẵn sàng • ${globalScoresFull.length} bản ghi` : supabaseError ?? "chưa cấu hình"} • Tên: <b className="text-white">{playerName}</b> • <span className="text-white/30">Client: {clientIdShort ? `${clientIdShort}…` : "…"}</span></div>
               <div className="mt-4">
                 {globalLoading ? (
                   <div className="py-8 text-center text-sm text-white/50">Đang tải bảng xếp hạng toàn cầu...</div>
