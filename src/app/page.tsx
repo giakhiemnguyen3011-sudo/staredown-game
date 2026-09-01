@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useFaceLandmarker } from "@/hooks/useFaceLandmarker";
-import { calcAvgEAR, EARSmoother, formatDuration, getAdaptiveThreshold, isEyeClosed } from "@/lib/ear";
+import { calcAvgEAR, EARSmoother, formatDuration, getAdaptiveThreshold, isEyeClosed, isEyeClosedQuick } from "@/lib/ear";
 import { getSupabase, getSupabaseConfigError, submitHighScore, HighScore, fetchGlobalLeaderboard, deleteMyGlobalScores } from "@/lib/supabase";
 import EyeOverlay from "@/components/EyeOverlay";
 import { useOnline } from "@/hooks/useOnline";
@@ -107,7 +107,7 @@ export default function Page() {
   const elapsedRef = useRef<number>(0);
   const streamRef = useRef<MediaStream | null>(null);
 
-  const { state: lmState, init: initLandmarker } = useFaceLandmarker(mode === "multi" ? 2 : 2);
+  const { state: lmState, init: initLandmarker } = useFaceLandmarker(mode === "single" ? 1 : 2);
   const landmarkerReady = lmState.status === "ready";
 
   const [fps, setFps] = useState(0);
@@ -581,8 +581,14 @@ export default function Page() {
 
     const loop = () => {
       if (!running) return;
-      rafRef.current = requestAnimationFrame(loop);
       const video = getVideo();
+      // Schedule next for max FPS: use video frame callback when available (tied to camera 60fps), fallback to rAF
+      const vcb = video as unknown as { requestVideoFrameCallback?: (cb: FrameRequestCallback) => number } | null;
+      if (video && vcb?.requestVideoFrameCallback) {
+        try { vcb.requestVideoFrameCallback(loop as unknown as FrameRequestCallback); } catch { rafRef.current = requestAnimationFrame(loop); }
+      } else {
+        rafRef.current = requestAnimationFrame(loop);
+      }
       if (!video || video.readyState < 2 || video.paused || video.ended) {
         // Nếu video chưa sẵn sàng, vẫn cập nhật faceCount 0 để UI hiện "Không thấy mặt"
         if (phaseRef.current === "ready" || phaseRef.current === "countdown") {
@@ -710,11 +716,11 @@ export default function Page() {
             avgBlend = ((left?.score ?? 0) + (right?.score ?? 0)) / 2;
           }
           const smoother = smootherRefs.current[sortedIdx] ?? (smootherRefs.current[sortedIdx] = new EARSmoother(SMOOTHER_WINDOW));
-          const ear = smoother.push(rawEar);
-          newEars.push(ear);
+          const smoothedEar = smoother.push(rawEar);
+          newEars.push(smoothedEar);
 
           const thresh = adaptiveThresholdRef.current ?? EAR_DEFAULT;
-          const isClosed = isEyeClosed(ear, avgBlend, thresh);
+          const isClosed = isEyeClosedQuick(rawEar, smoothedEar, avgBlend, thresh);
 
           if (isClosed) {
             closedFramesRef.current[sortedIdx] = (closedFramesRef.current[sortedIdx] ?? 0) + 1;
@@ -1572,7 +1578,7 @@ export default function Page() {
 
       <footer className="mt-auto border-t border-white/5 py-5 text-center text-xs text-white/30">
         <div className="max-w-6xl mx-auto px-4">
-          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60 FPS • MediaPipe 478 pts • v0.5.0 • Online BETA • build 2026-09-01
+          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60 FPS • MediaPipe 478 pts • v0.5.1 • Quick-blink fix • build 2026-09-01
         </div>
       </footer>
     </div>

@@ -61,6 +61,12 @@ export function useFaceLandmarker(numFaces = 2) {
   }, [numFaces]);
 
   useEffect(() => {
+    // Close previous if numFaces changed
+    if (landmarkerRef.current) {
+      try { landmarkerRef.current.close(); } catch {}
+      landmarkerRef.current = null;
+      setState({ status: "idle" });
+    }
     init();
     return () => {
       try {
@@ -68,7 +74,7 @@ export function useFaceLandmarker(numFaces = 2) {
       } catch {}
       landmarkerRef.current = null;
     };
-  }, [init]);
+  }, [init, numFaces]);
 
   return { state, init, landmarkerRef };
 }
