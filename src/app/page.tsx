@@ -2,9 +2,11 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useFaceLandmarker } from "@/hooks/useFaceLandmarker";
 import { calcAvgEAR, EARSmoother, formatDuration, getAdaptiveThreshold, isEyeClosed } from "@/lib/ear";
-import { getSupabase, getSupabaseConfigError, fetchHighScores, submitHighScore, HighScore, fetchGlobalLeaderboard } from "@/lib/supabase";
+import { getSupabase, getSupabaseConfigError, submitHighScore, HighScore, fetchGlobalLeaderboard, deleteMyGlobalScores } from "@/lib/supabase";
 import EyeOverlay from "@/components/EyeOverlay";
 import { useOnline } from "@/hooks/useOnline";
+import ThemePicker from "@/components/ThemePicker";
+import { getCurrentTheme, ThemePreset } from "@/lib/theme";
 
 // ---------- Constants ----------
 const EAR_DEFAULT = 0.2; // fallback nếu chưa hiệu chỉnh
@@ -70,7 +72,24 @@ export default function Page() {
   const onlineRef = useRef(online);
   useEffect(() => { onlineRef.current = online; }, [online]);
   const [onlineFriendInput, setOnlineFriendInput] = useState("");
-  const [onlineCountdownSync, setOnlineCountdownSync] = useState<number | null>(null);
+  const [_onlineCountdownSync, setOnlineCountdownSync] = useState<number | null>(null);
+  const [onlineLobbyTab, setOnlineLobbyTab] = useState<"public" | "all">("public");
+
+  // Theme
+  const [currentTheme, setCurrentTheme] = useState<ThemePreset>(() => getCurrentTheme());
+  useEffect(() => {
+    const upd = () => setCurrentTheme(getCurrentTheme());
+    window.addEventListener("theme-change", upd);
+    window.addEventListener("storage", upd);
+    upd();
+    return () => { window.removeEventListener("theme-change", upd); window.removeEventListener("storage", upd); };
+  }, []);
+
+  // Lobby subscribe for public rooms (auto)
+  useEffect(() => {
+    if (mode !== "online") return;
+    online.subscribeLobby(online.netMode);
+  }, [mode, online.netMode, online]);
 
   // Video / MediaPipe
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -132,6 +151,21 @@ export default function Page() {
   useEffect(() => {
     refreshGlobal(globalTab === "recent" ? 15 : 20, globalTab === "recent" ? "recent" : "top");
   }, [globalTab, refreshGlobal]);
+
+  // Delete Global (by client_id, robust to name change)
+  const [deleteGlobalLoading, setDeleteGlobalLoading] = useState(false);
+  const handleDeleteMyGlobal = useCallback(async () => {
+    if (!confirm("Xóa tất cả điểm Global của máy này? Hành động này sẽ xóa theo client_id (không phụ thuộc tên) và không thể hoàn tác.")) return;
+    setDeleteGlobalLoading(true);
+    const res = await deleteMyGlobalScores();
+    setDeleteGlobalLoading(false);
+    if (res.error) {
+      alert(`Lỗi xóa: ${res.error}`);
+    } else {
+      alert(`Đã xóa ${res.deletedCount} bản ghi Global của máy này.` + (res.deletedCount === 0 ? " (không có bản ghi nào thuộc máy này)" : ""));
+      refreshGlobal(20, globalTab === "recent" ? "recent" : "top");
+    }
+  }, [refreshGlobal, globalTab]);
 
   // Load local data
   useEffect(() => {
@@ -719,16 +753,16 @@ export default function Page() {
 
   // ---------- Render ----------
   return (
-    <div className="min-h-screen flex flex-col bg-[#070a14] text-white selection:bg-indigo-500/30">
-      {/* Background glows */}
+    <div className="min-h-screen flex flex-col text-white selection:bg-indigo-500/30" style={{ background: currentTheme.bg }}>
+      {/* Background glows - themed */}
       <div className="fixed inset-0 -z-10 overflow-hidden pointer-events-none">
-        <div className="absolute -top-[30%] -left-[20%] w-[80%] h-[80%] rounded-full blur-[120px] opacity-20 bg-gradient-to-br from-indigo-600 via-violet-600 to-fuchsia-600" />
-        <div className="absolute -bottom-[30%] -right-[20%] w-[80%] h-[80%] rounded-full blur-[120px] opacity-15 bg-gradient-to-br from-cyan-600 via-blue-600 to-indigo-600" />
+        <div className="absolute -top-[30%] -left-[20%] w-[80%] h-[80%] rounded-full blur-[120px] opacity-20" style={{ background: `linear-gradient(135deg, ${currentTheme.accent}, ${currentTheme.accent2})` }} />
+        <div className="absolute -bottom-[30%] -right-[20%] w-[80%] h-[80%] rounded-full blur-[120px] opacity-15" style={{ background: `linear-gradient(135deg, ${currentTheme.glow1}, ${currentTheme.glow2})` }} />
         <div className="absolute inset-0 bg-[linear-gradient(to_right,#ffffff06_1px,transparent_1px),linear-gradient(to_bottom,#ffffff06_1px,transparent_1px)] bg-[size:56px_56px]" />
       </div>
 
       {/* Header - gọn */}
-      <header className="sticky top-0 z-40 backdrop-blur-xl bg-[#070a14]/70 border-b border-white/10">
+      <header className="sticky top-0 z-40 backdrop-blur-xl border-b" style={{ background: `${currentTheme.bg}B3`, borderColor: currentTheme.border }}>
         <div className="max-w-6xl mx-auto px-4 sm:px-6 h-[56px] flex items-center justify-between gap-4">
           <button onClick={() => setMode("menu")} className="flex items-center gap-3 group">
             <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-indigo-500 to-violet-600 flex items-center justify-center shadow-lg shadow-indigo-500/25 group-hover:scale-105 transition">
@@ -869,9 +903,10 @@ export default function Page() {
                     <button onClick={() => setGlobalTab("recent")} className={`px-3 py-1 rounded-full text-xs font-bold transition ${globalTab === "recent" ? "bg-emerald-500 text-white shadow" : "text-white/60 hover:text-white"}`}>Mới nhất</button>
                   </div>
                   <button onClick={() => refreshGlobal(globalTab === "recent" ? 15 : 20, globalTab === "recent" ? "recent" : "top")} disabled={globalLoading} className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 text-xs hover:bg-white/10 disabled:opacity-50">↻ {globalLoading ? "..." : "Làm mới"}</button>
+                  <button onClick={handleDeleteMyGlobal} disabled={deleteGlobalLoading || !supabaseReady} title="Xóa tất cả điểm Global của máy này (theo client_id, không phụ thuộc tên)" className="px-3 py-1.5 rounded-full bg-red-500/15 border border-red-500/30 text-red-200 text-xs hover:bg-red-500/25 disabled:opacity-50">🗑 {deleteGlobalLoading ? "..." : "Xóa của tôi"}</button>
                 </div>
               </div>
-              <div className="mt-1 text-xs text-white/50">Lưu vào Supabase • {supabaseReady ? `sẵn sàng • ${globalScoresFull.length} bản ghi` : supabaseError ?? "chưa cấu hình"} • Tên: <b className="text-white">{playerName}</b></div>
+              <div className="mt-1 text-xs text-white/50">Lưu vào Supabase • {supabaseReady ? `sẵn sàng • ${globalScoresFull.length} bản ghi` : supabaseError ?? "chưa cấu hình"} • Tên: <b className="text-white">{playerName}</b> • <span className="text-white/30">Client: {typeof window !== "undefined" ? (localStorage.getItem("staredown_account_id_v1") || "").slice(0,6) : ""}…</span></div>
               <div className="mt-4">
                 {globalLoading ? (
                   <div className="py-8 text-center text-sm text-white/50">Đang tải bảng xếp hạng toàn cầu...</div>
@@ -903,6 +938,19 @@ export default function Page() {
               <div className="mt-3 text-xs text-white/40 flex flex-wrap gap-2 items-center justify-between">
                 <span>Global sync sau mỗi ván • tự động làm mới</span>
                 {supabaseReady && globalScoresFull.length>0 && <span className="text-emerald-300">● Live Supabase</span>}
+              </div>
+              <div className="mt-3 text-xs text-white/50 bg-white/5 border border-white/10 rounded-xl p-2.5">💡 <b>Xóa Global:</b> nút “Xóa của tôi” sẽ xóa tất cả bản ghi có <code className="px-1 py-0.5 bg-white/10 rounded">client_id</code> của máy bạn (được gắn khi đăng điểm), nên dù bạn đổi tên vẫn xóa đúng. Các điểm cũ trước khi có <code>client_id</code> sẽ được xóa qua lịch sử ID cục bộ nếu còn.</div>
+            </div>
+
+            {/* Theme customization */}
+            <div className="rounded-[24px] border p-6 backdrop-blur" style={{ borderColor: currentTheme.border, background: `linear-gradient(135deg, ${currentTheme.card}, transparent)` }}>
+              <h4 className="font-black flex items-center gap-2 text-sm tracking-widest" style={{ color: currentTheme.textAccent }}><span className="w-7 h-7 rounded-lg flex items-center justify-center" style={{ background: `${currentTheme.accent}33` }}>🎨</span> TÙY CHỈNH GIAO DIỆN</h4>
+              <div className="mt-1 text-xs text-white/50">Chọn bảng màu cho nền, viền và trang trí — áp dụng tức thì, lưu cục bộ</div>
+              <div className="mt-4"><ThemePicker onChange={setCurrentTheme} /></div>
+              <div className="mt-3 flex flex-wrap gap-2 text-xs">
+                <span className="px-3 py-1.5 rounded-full border" style={{ borderColor: currentTheme.border, background: `${currentTheme.accent}22`, color: currentTheme.textAccent }}>Nền: {currentTheme.bg}</span>
+                <span className="px-3 py-1.5 rounded-full border" style={{ borderColor: currentTheme.border, background: `${currentTheme.card}` }}>Viền: {currentTheme.border}</span>
+                <span className="px-3 py-1.5 rounded-full text-white" style={{ background: `linear-gradient(135deg, ${currentTheme.accent}, ${currentTheme.accent2})` }}>Accent: {currentTheme.accent}</span>
               </div>
             </div>
 
@@ -1426,14 +1474,51 @@ export default function Page() {
                     )}
                   </div>
 
-                  <div className="mt-3 p-3 rounded-xl bg-white/5 border border-white/10">
-                    <div className="text-xs font-bold text-white/70">Friend Code</div>
-                    <div className="mt-1 flex gap-2">
-                      <input value={onlineFriendInput} onChange={e => setOnlineFriendInput(e.target.value.toUpperCase())} placeholder="Nhập mã bạn bè (ví dụ ABCD12)" maxLength={8} className="flex-1 px-3 py-2 rounded-xl bg-black/30 border border-white/10 focus:border-cyan-400 outline-none font-mono text-sm uppercase" />
-                      <button onClick={() => online.createFriendRoom()} className="px-3 py-2 rounded-xl bg-white/10 border border-white/10 text-xs font-bold hover:bg-white/15">Tạo</button>
-                      <button onClick={() => { if (onlineFriendInput.trim()) online.joinFriendRoom(onlineFriendInput); }} className="px-3 py-2 rounded-xl bg-cyan-500 text-white text-xs font-bold hover:bg-cyan-400">Vào</button>
+                  <div className="mt-3 p-3 rounded-xl bg-white/5 border border-white/10 space-y-3">
+                    <div>
+                      <div className="text-xs font-bold text-white/70">Tạo phòng — chọn quyền riêng tư</div>
+                      <div className="mt-1 flex gap-2">
+                        <button onClick={() => online.setRoomVisibility("public")} className={`flex-1 py-2 rounded-xl border text-xs font-bold transition ${online.roomVisibility === "public" ? "bg-emerald-500 text-white border-emerald-400" : "bg-white/5 border-white/10 text-white/60 hover:bg-white/10"}`}>🌐 Public</button>
+                        <button onClick={() => online.setRoomVisibility("friend")} className={`flex-1 py-2 rounded-xl border text-xs font-bold transition ${online.roomVisibility === "friend" ? "bg-amber-500 text-black border-amber-400" : "bg-white/5 border-white/10 text-white/60 hover:bg-white/10"}`}>🔒 Friend-only</button>
+                      </div>
+                      <button onClick={() => online.createRoomWithVisibility(online.roomVisibility)} className="mt-2 w-full py-2.5 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 text-white text-xs font-black hover:from-cyan-500 hover:to-blue-500">+ Tạo phòng {online.roomVisibility === "public" ? "Public" : "Friend-only"} ({online.netMode.toUpperCase()})</button>
+                      <div className="text-xs text-white/40 mt-1">{online.roomVisibility === "public" ? "Public: hiện trong tab tìm phòng, ai cũng vào được" : "Friend-only: vẫn hiện trong tab nhưng chỉ vào được bằng mã"}</div>
                     </div>
-                    <div className="text-xs text-white/40 mt-1">Tạo phòng dùng mã của bạn, hoặc nhập mã bạn bè để vào. Đảm bảo cả hai đã sẵn sàng camera.</div>
+                    <div className="border-t border-white/10 pt-3">
+                      <div className="text-xs font-bold text-white/70">Hoặc nhập Friend Code</div>
+                      <div className="mt-1 flex gap-2">
+                        <input value={onlineFriendInput} onChange={e => setOnlineFriendInput(e.target.value.toUpperCase())} placeholder="Nhập mã (ABCD12)" maxLength={8} className="flex-1 px-3 py-2 rounded-xl bg-black/30 border border-white/10 focus:border-cyan-400 outline-none font-mono text-sm uppercase" />
+                        <button onClick={() => { if (onlineFriendInput.trim()) online.joinFriendRoom(onlineFriendInput); }} className="px-3 py-2 rounded-xl bg-cyan-500 text-white text-xs font-bold hover:bg-cyan-400">Vào</button>
+                      </div>
+                    </div>
+                    <div className="border-t border-white/10 pt-3">
+                      <div className="flex items-center justify-between">
+                        <div className="text-xs font-bold text-white/70">Danh sách phòng — {online.netMode.toUpperCase()}</div>
+                        <div className="flex p-1 rounded-full bg-white/5 border border-white/10">
+                          <button onClick={() => setOnlineLobbyTab("public")} className={`px-2.5 py-1 rounded-full text-xs font-bold transition ${onlineLobbyTab === "public" ? "bg-cyan-500 text-white shadow" : "text-white/60 hover:text-white"}`}>Public</button>
+                          <button onClick={() => setOnlineLobbyTab("all")} className={`px-2.5 py-1 rounded-full text-xs font-bold transition ${onlineLobbyTab === "all" ? "bg-cyan-500 text-white shadow" : "text-white/60 hover:text-white"}`}>Tất cả</button>
+                        </div>
+                      </div>
+                      <div className="mt-2 space-y-2 max-h-[180px] overflow-auto pr-1">
+                        {online.publicRooms.length === 0 && (
+                          <div className="text-xs text-white/40 text-center py-4 border border-dashed border-white/10 rounded-xl">Chưa có phòng nào — hãy tạo Public để hiện ở đây<br/><span className="text-white/30">Random sẽ vào nhanh phòng Public</span></div>
+                        )}
+                        {online.publicRooms.length > 0 && online.publicRooms.filter(r => onlineLobbyTab === "public" ? r.visibility === "public" : true).map(r => (
+                          <div key={r.code} className="flex items-center gap-2 p-2 rounded-xl bg-white/5 border border-white/5">
+                            <div className="flex-1 min-w-0">
+                              <div className="text-sm font-mono font-bold flex items-center gap-1.5">{r.code} <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-black ${r.visibility === "public" ? "bg-emerald-500 text-white" : "bg-amber-500 text-black"}`}>{r.visibility === "public" ? "Public" : "Friend"}</span> <span className="text-[10px] px-1 py-0.5 rounded-full bg-white/10 border border-white/10">{r.netMode.toUpperCase()}</span></div>
+                              <div className="text-xs text-white/50 truncate">{r.hostName} • {new Date(r.createdAt).toLocaleTimeString("vi-VN")}</div>
+                            </div>
+                            {r.visibility === "public" ? (
+                              <button onClick={() => online.joinPublicRoom(r.code)} className="px-3 py-1.5 rounded-full bg-emerald-500 text-white text-xs font-bold hover:bg-emerald-400">Vào</button>
+                            ) : (
+                              <span className="px-2.5 py-1 rounded-full bg-white/5 border border-white/10 text-xs text-white/40">Cần mã</span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                      <div className="text-xs text-white/30 mt-1">Public: vào tùy ý • Friend-only: hiện nhưng cần mã • Random: vào nhanh Public</div>
+                    </div>
                   </div>
                 </div>
 
@@ -1478,7 +1563,7 @@ export default function Page() {
 
       <footer className="mt-auto border-t border-white/5 py-5 text-center text-xs text-white/30">
         <div className="max-w-6xl mx-auto px-4">
-          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60 FPS • MediaPipe 478 pts • v0.4.0-beta • Online BETA • build 2026-08-31-online
+          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60 FPS • MediaPipe 478 pts • v0.5.0 • Online BETA • build 2026-09-01
         </div>
       </footer>
     </div>

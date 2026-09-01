@@ -28,7 +28,7 @@ type RoomEvent =
   | { type: "webrtc_ice"; from: string; candidate: RTCIceCandidateInit }
   | { type: "leave"; from: string };
 
-type MatchmakingEvent =
+type _MatchmakingEvent =
   | { type: "searching"; from: string; name: string; friendCode: string; ts: number }
   | { type: "match_invite"; from: string; to: string; roomCode: string; name: string }
   | { type: "match_accept"; from: string; to: string; roomCode: string };
@@ -47,11 +47,14 @@ export function useOnline(playerName: string) {
   const [searchingState, setSearchingState] = useState<string>("idle");
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [isConnected, setIsConnected] = useState(false);
+  const [publicRooms, setPublicRooms] = useState<Array<{ code: string; hostName: string; hostId: string; visibility: "public" | "friend"; createdAt: number; netMode: OnlineNetMode }>>([]);
+  // keep legacy alias for roomCode vs code mismatch fix
+  const [roomVisibility, setRoomVisibility] = useState<"public" | "friend">("public");
 
   const matchmakingChannelRef = useRef<RealtimeChannel | null>(null);
   const roomChannelRef = useRef<RealtimeChannel | null>(null);
+  const lobbyChannelRef = useRef<RealtimeChannel | null>(null);
   const pingTrackerRef = useRef(new PingTracker(5));
-  const opponentPingRef = useRef(0);
   const accountRef = useRef(account);
   const playerNameRef = useRef(playerName);
   const phaseRef = useRef(phase);
@@ -62,8 +65,8 @@ export function useOnline(playerName: string) {
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
   const webrtcReadyRef = useRef(false);
+  const [isWebRTCReady, setIsWebRTCReady] = useState(false);
   const pingIntervalRef = useRef<number | null>(null);
-  const lastPongRef = useRef<Map<number, number>>(new Map());
 
   useEffect(() => { accountRef.current = account; }, [account]);
   useEffect(() => { playerNameRef.current = playerName; }, [playerName]);
@@ -97,12 +100,17 @@ export function useOnline(playerName: string) {
       try { getSupabase()?.removeChannel(roomChannelRef.current); } catch {}
       roomChannelRef.current = null;
     }
+    if (lobbyChannelRef.current) {
+      try { getSupabase()?.removeChannel(lobbyChannelRef.current); } catch {}
+      lobbyChannelRef.current = null;
+    }
     // close webrtc
     try { dcRef.current?.close(); } catch {}
     try { pcRef.current?.close(); } catch {}
     dcRef.current = null;
     pcRef.current = null;
     webrtcReadyRef.current = false;
+    setIsWebRTCReady(false);
     if (pingIntervalRef.current) {
       window.clearInterval(pingIntervalRef.current);
       pingIntervalRef.current = null;
@@ -259,22 +267,24 @@ export function useOnline(playerName: string) {
         console.log("[webrtc] state", pc.connectionState);
         if (pc.connectionState === "connected") {
           webrtcReadyRef.current = true;
+          setIsWebRTCReady(true);
           console.log("[webrtc] P2P ready, switching to data channel for low ping");
         } else if (pc.connectionState === "failed" || pc.connectionState === "closed") {
           webrtcReadyRef.current = false;
+          setIsWebRTCReady(false);
         }
       };
       if (isInitiator) {
         const dc = pc.createDataChannel("game", { ordered: true });
-        dc.onopen = () => { webrtcReadyRef.current = true; console.log("[webrtc] dc open initiator"); };
-        dc.onclose = () => { webrtcReadyRef.current = false; };
+        dc.onopen = () => { webrtcReadyRef.current = true; setIsWebRTCReady(true); console.log("[webrtc] dc open initiator"); };
+        dc.onclose = () => { webrtcReadyRef.current = false; setIsWebRTCReady(false); };
         dc.onmessage = (ev) => handleDCMessage(ev.data);
         dcRef.current = dc;
       } else {
         pc.ondatachannel = (ev) => {
           const dc = ev.channel;
-          dc.onopen = () => { webrtcReadyRef.current = true; console.log("[webrtc] dc open guest"); };
-          dc.onclose = () => { webrtcReadyRef.current = false; };
+          dc.onopen = () => { webrtcReadyRef.current = true; setIsWebRTCReady(true); console.log("[webrtc] dc open guest"); };
+          dc.onclose = () => { webrtcReadyRef.current = false; setIsWebRTCReady(false); };
           dc.onmessage = (ev2) => handleDCMessage(ev2.data);
           dcRef.current = dc;
         };
@@ -335,6 +345,92 @@ export function useOnline(playerName: string) {
     roomChannelRef.current = channel;
     return channel;
   }, [friendCode, netMode]);
+
+  // Lobby for Public / Friend-only rooms listing
+  const subscribeLobby = useCallback((mode: OnlineNetMode = "global") => {
+    const supabase = getSupabase();
+    if (!supabase) return;
+    // if already subscribed to same mode lobby, keep
+    if (lobbyChannelRef.current) {
+      try { supabase.removeChannel(lobbyChannelRef.current); } catch {}
+      lobbyChannelRef.current = null;
+    }
+    const channel = supabase.channel(`online:lobby:${mode}`, {
+      config: { broadcast: { self: false }, presence: { key: accountRef.current.id } }
+    });
+    channel.on("presence", { event: "sync" }, () => {
+      const state = channel.presenceState() as unknown as Record<string, Array<{ roomCode: string; code?: string; hostName: string; hostId: string; visibility: "public" | "friend"; createdAt: number; netMode: OnlineNetMode }>>;
+      const all = Object.values(state).flat();
+      // deduplicate by roomCode/code
+      const map = new Map<string, typeof all[0]>();
+      all.forEach(r => {
+        const c = (r as unknown as { code?: string; roomCode?: string }).code || (r as unknown as { roomCode?: string }).roomCode;
+        if (c && !map.has(c)) map.set(c, r);
+      });
+      const mapped = Array.from(map.values()).map(r => {
+        const c = (r as unknown as { code?: string; roomCode?: string }).code || (r as unknown as { roomCode?: string }).roomCode || "";
+        return { code: c, hostName: r.hostName, hostId: r.hostId, visibility: r.visibility, createdAt: r.createdAt, netMode: r.netMode };
+      }).filter(r => r.netMode === mode).slice(0, 20);
+      setPublicRooms(mapped as unknown as Array<{ code: string; hostName: string; hostId: string; visibility: "public" | "friend"; createdAt: number; netMode: OnlineNetMode }>);
+    });
+    channel.subscribe(async (status) => {
+      if (status === "SUBSCRIBED") {
+        // track as observer (no room) to receive presence, but don't announce
+        await channel.track({ observer: true, id: accountRef.current.id } as unknown as Record<string, unknown>);
+        console.log(`[lobby] subscribed ${mode}`);
+      }
+    });
+    lobbyChannelRef.current = channel;
+  }, []);
+
+  const announceRoomInLobby = useCallback((code: string, visibility: "public" | "friend", mode: OnlineNetMode) => {
+    const supabase = getSupabase();
+    if (!supabase) return;
+    // ensure lobby channel exists and track room
+    const lobbyChannelName = `online:lobby:${mode}`;
+    // if existing lobby channel is for different mode, resubscribe
+    if (lobbyChannelRef.current) {
+      try { supabase.removeChannel(lobbyChannelRef.current); } catch {}
+      lobbyChannelRef.current = null;
+    }
+    const channel = supabase.channel(lobbyChannelName, {
+      config: { broadcast: { self: false }, presence: { key: accountRef.current.id } }
+    });
+    channel.subscribe(async (status) => {
+      if (status === "SUBSCRIBED") {
+        await channel.track({ code: code.toUpperCase(), roomCode: code.toUpperCase(), hostName: playerNameRef.current, hostId: accountRef.current.id, visibility, createdAt: Date.now(), netMode: mode });
+        console.log(`[lobby] announced room ${code} ${visibility} ${mode}`);
+        // also keep publicRooms updated via sync
+        channel.on("presence", { event: "sync" }, () => {
+          const state = channel.presenceState() as unknown as Record<string, Array<{ roomCode: string; code?: string; hostName: string; hostId: string; visibility: "public" | "friend"; createdAt: number; netMode: OnlineNetMode }>>;
+          const all = Object.values(state).flat().filter(r => (r as unknown as { roomCode?: string; code?: string }).roomCode || (r as unknown as { code?: string }).code);
+          const map = new Map<string, typeof all[0]>();
+          all.forEach(r => {
+            const rc = (r as unknown as { code?: string; roomCode?: string }).code || (r as unknown as { roomCode?: string }).roomCode;
+            if (rc && !map.has(rc)) map.set(rc, r);
+          });
+          const mapped = Array.from(map.values()).map(r => {
+            const c = (r as unknown as { code?: string; roomCode?: string }).code || (r as unknown as { roomCode?: string }).roomCode || "";
+            return { code: c, hostName: r.hostName, hostId: r.hostId, visibility: r.visibility, createdAt: r.createdAt, netMode: r.netMode };
+          }).filter(r => r.netMode === mode).slice(0, 20);
+          setPublicRooms(mapped as unknown as Array<{ code: string; hostName: string; hostId: string; visibility: "public" | "friend"; createdAt: number; netMode: OnlineNetMode }>);
+        });
+      }
+    });
+    lobbyChannelRef.current = channel;
+  }, []);
+
+  const createRoomWithVisibility = useCallback((visibility: "public" | "friend") => {
+    const code = visibility === "public" ? generateFriendCode() : friendCode; // public uses random, friend uses own code for easy share
+    cleanupMatchmaking();
+    joinRoomChannel(code, "host");
+    setRoomVisibility(visibility);
+    setPhase("room");
+    setSearchingState(visibility === "public" ? `Phòng Public ${code} • chờ người vào...` : `Phòng Friend-only ${code} • chờ bạn bè...`);
+    // announce in lobby
+    announceRoomInLobby(code, visibility, netMode);
+    return code;
+  }, [friendCode, netMode, joinRoomChannel, cleanupMatchmaking, announceRoomInLobby]);
 
   // Matchmaking via presence on shared channel
   const startRandomMatchmaking = useCallback((mode: OnlineNetMode) => {
@@ -451,13 +547,12 @@ export function useOnline(playerName: string) {
   }, [cleanupMatchmaking]);
 
   const createFriendRoom = useCallback(() => {
-    const code = friendCode; // use own friend code as room code for simplicity
-    cleanupMatchmaking();
-    joinRoomChannel(code, "host");
-    setPhase("room");
-    setSearchingState(`Phòng ${code} • chờ bạn bè...`);
-    return code;
-  }, [friendCode, joinRoomChannel, cleanupMatchmaking]);
+    return createRoomWithVisibility("friend");
+  }, [createRoomWithVisibility]);
+
+  const createPublicRoom = useCallback(() => {
+    return createRoomWithVisibility("public");
+  }, [createRoomWithVisibility]);
 
   const joinFriendRoom = useCallback((inputCode: string) => {
     const code = inputCode.trim().toUpperCase();
@@ -465,10 +560,22 @@ export function useOnline(playerName: string) {
     if (code === friendCode) { setErrorMsg("Không thể tự tham gia phòng của mình"); return; }
     cleanupMatchmaking();
     joinRoomChannel(code, "guest");
+    setRoomVisibility("friend");
     setPhase("room");
     setSearchingState(`Đang tham gia phòng ${code}...`);
     return code;
   }, [friendCode, joinRoomChannel, cleanupMatchmaking]);
+
+  const joinPublicRoom = useCallback((code: string) => {
+    const upper = code.trim().toUpperCase();
+    if (!upper) { setErrorMsg("Mã phòng trống"); return; }
+    cleanupMatchmaking();
+    joinRoomChannel(upper, "guest");
+    setRoomVisibility("public");
+    setPhase("room");
+    setSearchingState(`Đang vào phòng Public ${upper}...`);
+    return upper;
+  }, [joinRoomChannel, cleanupMatchmaking]);
 
   const leaveRoom = useCallback(() => {
     // broadcast leave
@@ -564,14 +671,22 @@ export function useOnline(playerName: string) {
     errorMsg,
     setErrorMsg,
     isConnected,
+    publicRooms,
+    roomVisibility,
+    setRoomVisibility,
+    subscribeLobby,
+    announceRoomInLobby,
+    createRoomWithVisibility,
     startRandomMatchmaking,
     cancelMatchmaking,
     createFriendRoom,
+    createPublicRoom,
     joinFriendRoom,
+    joinPublicRoom,
     leaveRoom,
     broadcastCountdownStart,
     broadcastBlink,
     broadcastTrackingLost,
-    isWebRTCReady: webrtcReadyRef.current,
+    isWebRTCReady,
   };
 }
