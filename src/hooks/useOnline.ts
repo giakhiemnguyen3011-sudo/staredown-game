@@ -66,11 +66,13 @@ export function useOnline(playerName: string) {
   const roomCodeRef = useRef(roomCode);
   const selfReadyRef = useRef(selfCameraReady);
 
-  // WebRTC refs for LAN optimization
+  // WebRTC refs for LAN optimization + remote video
   const pcRef = useRef<RTCPeerConnection | null>(null);
   const dcRef = useRef<RTCDataChannel | null>(null);
   const webrtcReadyRef = useRef(false);
   const [isWebRTCReady, setIsWebRTCReady] = useState(false);
+  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const localStreamRef = useRef<MediaStream | null>(null);
   const pingIntervalRef = useRef<number | null>(null);
 
   useEffect(() => { accountRef.current = account; }, [account]);
@@ -86,6 +88,22 @@ export function useOnline(playerName: string) {
     setFriendCode(newCode);
     setAccount(prev => ({ ...prev, friendCode: newCode }));
     return newCode;
+  }, []);
+
+  const addLocalStream = useCallback((stream: MediaStream) => {
+    localStreamRef.current = stream;
+    if (pcRef.current) {
+      try {
+        stream.getTracks().forEach(track => {
+          // Avoid adding duplicate senders
+          const senders = pcRef.current!.getSenders();
+          if (!senders.find(s => s.track && s.track.id === track.id)) {
+            pcRef.current!.addTrack(track, stream);
+          }
+        });
+        console.log("[webrtc] added local tracks", stream.getTracks().length);
+      } catch (e) { console.warn("[webrtc] addTrack failed", e); }
+    }
   }, []);
 
   // Cleanup helper
@@ -279,6 +297,19 @@ export function useOnline(playerName: string) {
           setIsWebRTCReady(false);
         }
       };
+      pc.ontrack = (event) => {
+        console.log("[webrtc] ontrack", event.track.kind, event.streams[0]?.id);
+        const stream = event.streams && event.streams[0] ? event.streams[0] : new MediaStream([event.track]);
+        setRemoteStream(stream);
+      };
+      // If we already have a local stream (camera), add its tracks now
+      if (localStreamRef.current) {
+        try {
+          localStreamRef.current.getTracks().forEach(track => {
+            if (!pc.getSenders().find(s => s.track?.id === track.id)) pc.addTrack(track, localStreamRef.current!);
+          });
+        } catch (e) { console.warn("[webrtc] addTrack on ensurePeer failed", e); }
+      }
       if (isInitiator) {
         const dc = pc.createDataChannel("game", { ordered: true });
         dc.onopen = () => { webrtcReadyRef.current = true; setIsWebRTCReady(true); console.log("[webrtc] dc open initiator"); };
@@ -682,6 +713,8 @@ export function useOnline(playerName: string) {
     subscribeLobby,
     announceRoomInLobby,
     createRoomWithVisibility,
+    remoteStream,
+    addLocalStream,
     startRandomMatchmaking,
     cancelMatchmaking,
     createFriendRoom,
