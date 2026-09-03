@@ -94,10 +94,7 @@ export function isEyeClosedQuick(rawEar: number, smoothedEar: number, avgBlend: 
   return false;
 }
 
-// === NEW DELTA METHOD (baseline trước vào lượt) ===
-// baseline: EAR lúc mắt mở ổn định trước khi countdown/playing
-// Nếu EAR giảm mạnh 0.08~0.15 trong thời gian ngắn → tính là chớp
-// Giữ lại isEyeClosed/isEyeClosedQuick làm fallback nếu cần chỉnh lại
+// === DELTA METHOD - Theo yêu cầu: lấy mốc lúc bắt đầu, nếu EAR giảm 0.08~0.23 → lập tức nhắm ===
 export function isEyeClosedDelta(
   rawEar: number,
   smoothedEar: number,
@@ -106,23 +103,22 @@ export function isEyeClosedDelta(
   threshold: number
 ): { closed: boolean; delta: number | null; method: "delta" | "legacy" | "none" } {
   if (baseline === null || !isFinite(baseline) || baseline < 0.12 || baseline > 0.45) {
-    // chưa có baseline → dùng legacy
     const legacy = isEyeClosedQuick(rawEar, smoothedEar, avgBlend, threshold);
     return { closed: legacy, delta: null, method: legacy ? "legacy" : "none" };
   }
   const deltaRaw = baseline - rawEar;
   const deltaSmooth = baseline - smoothedEar;
   const delta = Math.max(deltaRaw, deltaSmooth);
-  // Giảm 0.08~0.15 trong ngắn hạn → chớp. Cho phép 0.07-0.16 để dung sai
-  if (delta >= 0.07 && delta <= 0.18) {
-    // Đảm bảo không phải nheo nhẹ: cần rawEar thực sự thấp hơn ngưỡng hoặc blend hỗ trợ
-    if (rawEar < threshold || smoothedEar < threshold || (avgBlend ?? 0) > 0.25) {
-      return { closed: true, delta, method: "delta" };
-    }
+  // Yêu cầu chính: giảm 0.08~0.23 so với mốc bắt đầu → lập tức xác nhận nhắm
+  if (delta >= 0.08 && delta <= 0.23) {
+    return { closed: true, delta, method: "delta" };
   }
-  // Giảm sâu hơn 0.15 → chắc chắn nhắm
-  if (delta > 0.15) return { closed: true, delta, method: "delta" };
-  // Fallback legacy nếu delta chưa đủ nhưng legacy lại bắt được (giữ để phòng chỉnh lại)
+  // Giảm sâu hơn 0.23 (nhắm rất chặt, từ 0.32 xuống 0.05 = 0.27) cũng tính là nhắm
+  if (delta > 0.23) return { closed: true, delta, method: "delta" };
+  // Giảm 0.06~0.08 với blend hỗ trợ vẫn tính để bắt nheo + kính (giữ nhạy)
+  if (delta >= 0.06 && delta < 0.08 && (avgBlend ?? 0) > 0.30) {
+    return { closed: true, delta, method: "delta" };
+  }
   const legacy = isEyeClosedQuick(rawEar, smoothedEar, avgBlend, threshold);
   return { closed: legacy, delta, method: legacy ? "legacy" : "none" };
 }
