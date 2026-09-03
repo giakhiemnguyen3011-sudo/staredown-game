@@ -245,7 +245,7 @@ export default function Page() {
         await new Promise<void>(res => {
           const onLoaded = () => { res(); };
           v.addEventListener("loadedmetadata", onLoaded, { once: true });
-          setTimeout(() => res(), 2000);
+          setTimeout(() => res(), 5000);
         });
       }
       await v.play().catch(() => {

@@ -364,10 +364,10 @@ export function useOnline(playerName: string) {
         setRoomCode(upper);
         setRole(asRole);
         startPingLoop();
-        // If host and lan mode, attempt webrtc as initiator
+        // If host and lan mode, attempt webrtc as initiator - increased to avoid race timeout
         if (asRole === "host" && netMode === "lan") {
-          // delay 800ms to let guest join
-          setTimeout(() => ensurePeer(true).catch(e=>console.warn(e)), 800);
+          // delay 1500ms to let guest join (tránh timeout khi guest chậm)
+          setTimeout(() => ensurePeer(true).catch(e=>console.warn(e)), 1500);
         } else if (asRole === "guest" && netMode === "lan") {
           // guest will wait for offer
         }
@@ -554,18 +554,20 @@ export function useOnline(playerName: string) {
         channel.send({ type: "broadcast", event: "searching", payload: { from: accountRef.current.id, name: playerNameRef.current, friendCode: friendCode, ts: Date.now() } });
         setIsConnected(true);
         console.log(`[matchmaking] searching on ${channelName}`);
-        // timeout after 30s
+        // timeout after 30s - increased to avoid work timeout
         setTimeout(() => {
           if (phaseRef.current === "searching" && !matched) {
-            setSearchingState("Chưa tìm thấy ai • đang chờ...");
+            setSearchingState("Chưa tìm thấy ai • đang chờ... (tự reconnect)");
           }
-        }, 2500);
+        }, 5000);
         setTimeout(() => {
           if (phaseRef.current === "searching" && !matched) {
-            setErrorMsg("Không tìm thấy đối thủ sau 45s. Thử lại hoặc dùng Friend Code.");
-            setSearchingState("Hết thời gian chờ");
+            setErrorMsg("Không tìm thấy đối thủ sau 90s. Đang tự thử lại...");
+            setSearchingState("Tự reconnect...");
+            // auto retry once to avoid manual timeout
+            try { channel.send({ type: "broadcast", event: "searching", payload: { from: accountRef.current.id, name: playerNameRef.current, friendCode: friendCode, ts: Date.now() } }); } catch {}
           }
-        }, 45000);
+        }, 90000);
       } else if (status === "CHANNEL_ERROR") {
         setErrorMsg("Lỗi kết nối matchmaking");
         setPhase("idle");
