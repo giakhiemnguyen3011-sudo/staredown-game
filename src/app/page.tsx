@@ -1,7 +1,7 @@
 "use client";
 import { useEffect, useRef, useState, useCallback } from "react";
 import { useFaceLandmarker } from "@/hooks/useFaceLandmarker";
-import { calcAvgEAR, EARSmoother, formatDuration, getAdaptiveThreshold, isEyeClosedQuick, isEyeClosedDelta } from "@/lib/ear";
+import { calcAvgEAR, EARSmoother, formatDuration, getAdaptiveThreshold, isEyeClosedQuick } from "@/lib/ear";
 import { getSupabase, getSupabaseConfigError, submitHighScore, HighScore, deleteMyGlobalScores, getWeeklyRangeLabel } from "@/lib/supabase";
 import EyeOverlay from "@/components/EyeOverlay";
 import { useOnline } from "@/hooks/useOnline";
@@ -161,9 +161,6 @@ export default function Page() {
   const calibrationSamplesRef = useRef<number[]>([]);
   const adaptiveThresholdRef = useRef<number>(EAR_DEFAULT);
   const [adaptiveThresholdUI, setAdaptiveThresholdUI] = useState<number>(EAR_DEFAULT);
-  // Delta baseline: mốc lúc bắt đầu (mỗi player)
-  const deltaBaselineRef = useRef<(number | null)[]>([null, null]);
-  const [deltaBaselineUI, setDeltaBaselineUI] = useState<(number | null)[]>([null, null]);
   // For countdown tracking lost
   const countdownTrackingLostRef = useRef(0);
   // Online refs for fairness
@@ -318,8 +315,6 @@ export default function Page() {
       setEarValues([]);
       setFaceCount(0);
       calibrationSamplesRef.current = [];
-      deltaBaselineRef.current = [null, null];
-      setDeltaBaselineUI([null, null]);
       // Leave online room when back to menu
       if (onlineRef.current.phase !== "idle") onlineRef.current.leaveRoom();
     } else {
@@ -343,23 +338,14 @@ export default function Page() {
       setTrackingWarning(false);
       smootherRefs.current.forEach(s => s.reset());
       closedFramesRef.current = [0, 0];
-      // Finalize adaptive threshold + delta baseline (mốc bắt đầu)
+      // Finalize adaptive threshold from calibration samples
       if (calibrationSamplesRef.current.length >= 8) {
         const sorted = [...calibrationSamplesRef.current].sort((a,b)=>a-b);
         const median = sorted[Math.floor(sorted.length/2)];
         const tuned = getAdaptiveThreshold(median);
         adaptiveThresholdRef.current = tuned;
         setAdaptiveThresholdUI(tuned);
-        deltaBaselineRef.current = [median, median];
-        setDeltaBaselineUI([median, median]);
-        console.log(`[EAR] calibrated median=${median.toFixed(3)} -> thresh=${tuned.toFixed(3)} baseline delta=${median.toFixed(3)} (${calibrationSamplesRef.current.length} samples)`);
-      } else if (earValues.length > 0) {
-        const fallback = earValues[0] ?? EAR_DEFAULT;
-        if (fallback > 0.15 && fallback < 0.45) {
-          deltaBaselineRef.current = [fallback, fallback];
-          setDeltaBaselineUI([fallback, fallback]);
-          console.log(`[EAR] fallback baseline=${fallback.toFixed(3)} from preview`);
-        }
+        console.log(`[EAR] calibrated median=${median.toFixed(3)} -> thresh=${tuned.toFixed(3)} (${calibrationSamplesRef.current.length} samples)`);
       }
       return;
     }
@@ -393,8 +379,6 @@ export default function Page() {
     calibrationSamplesRef.current = [];
     adaptiveThresholdRef.current = EAR_DEFAULT;
     setAdaptiveThresholdUI(EAR_DEFAULT);
-    deltaBaselineRef.current = [null, null];
-    setDeltaBaselineUI([null, null]);
     onlineBlinkTsRef.current = { local: null, remote: null };
     onlineFinishedAtRef.current = null;
   }, [landmarkerReady, phase]);
@@ -424,8 +408,6 @@ export default function Page() {
       calibrationSamplesRef.current = [];
       adaptiveThresholdRef.current = EAR_DEFAULT;
       setAdaptiveThresholdUI(EAR_DEFAULT);
-      deltaBaselineRef.current = [null, null];
-      setDeltaBaselineUI([null, null]);
       onlineBlinkTsRef.current = { local: null, remote: null };
       onlineFinishedAtRef.current = null;
       setOnlineCountdownSync(detail.startAt);
@@ -776,13 +758,7 @@ export default function Page() {
           newEars.push(smoothedEar);
 
           const thresh = adaptiveThresholdRef.current ?? EAR_DEFAULT;
-          const baseline = deltaBaselineRef.current[sortedIdx] ?? deltaBaselineRef.current[0] ?? null;
-          const deltaRes = isEyeClosedDelta(rawEar, smoothedEar, baseline, avgBlend, thresh);
-          const isClosed = deltaRes.closed;
-          if (isClosed && deltaRes.method === "delta" && deltaRes.delta !== null) {
-            // debug delta
-            // console.log(`[EAR delta] idx=${sortedIdx} base=${baseline?.toFixed(3)} raw=${rawEar.toFixed(3)} smooth=${smoothedEar.toFixed(3)} delta=${deltaRes.delta.toFixed(3)} blend=${avgBlend?.toFixed(2)}`);
-          }
+          const isClosed = isEyeClosedQuick(rawEar, smoothedEar, avgBlend, thresh);
 
           if (isClosed) {
             closedFramesRef.current[sortedIdx] = (closedFramesRef.current[sortedIdx] ?? 0) + 1;
@@ -874,7 +850,7 @@ export default function Page() {
               <div className="absolute inset-0 bg-gradient-to-br from-indigo-600/20 via-transparent to-fuchsia-600/10 pointer-events-none" />
               <div className="relative">
                 <div className="inline-flex items-center gap-2 text-[11px] tracking-widest font-semibold px-3 py-1 rounded-full bg-indigo-500/15 border border-indigo-500/30 text-indigo-300">
-                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" /> NGƯỠNG EAR TỰ ĐỘNG {adaptiveThresholdUI.toFixed(2)} (0.17-0.24) • KẾT THÚC NGAY KHI NHẮM • CHỐNG NHEO + HỖ TRỢ KÍNH
+                  <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-pulse" /> NGƯỠNG EAR TỰ ĐỘNG {adaptiveThresholdUI.toFixed(2)} (0.15-0.24) • KẾT THÚC NGAY KHI NHẮM • MẮT HÍ & CHỚP NHANH
                 </div>
                 <h1 className="mt-3 text-3xl sm:text-[40px] font-black tracking-tight leading-[0.95]">
                   AI CHỚP MẮT <span className="bg-gradient-to-r from-indigo-400 via-violet-400 to-fuchsia-400 bg-clip-text text-transparent">TRƯỚC SẼ THUA</span>
@@ -885,7 +861,7 @@ export default function Page() {
                 <div className="mt-4 flex flex-wrap gap-2 text-xs">
                   <span className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10">Best: <b className="font-mono text-white">{bestSingleMs ? formatDuration(bestSingleMs) : "--"}</b></span>
                   <span className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10">{localScores.length} lượt • Top {Math.min(localScores.length,5)} local</span>
-                  <span className="px-3 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/20 text-emerald-200">● 120FPS • EAR {adaptiveThresholdUI.toFixed(2)} (delta 0.08)</span>
+                  <span className="px-3 py-1.5 rounded-full bg-emerald-500/15 border border-emerald-500/20 text-emerald-200">● 120FPS • EAR {adaptiveThresholdUI.toFixed(2)} • MẮT HÍ / CHỚP NHANH</span>
                 </div>
               </div>
             </div>
@@ -1305,10 +1281,6 @@ export default function Page() {
                       <div className="text-[11px] text-white/50">MẮT</div>
                       <div className={`font-bold text-sm ${blinkStates[0] === "closed" ? "text-red-400" : trackingWarning ? "text-amber-300" : "text-emerald-300"}`}>{trackingWarning ? "MẤT" : blinkStates[0] ?? "--"}</div>
                     </div>
-                  </div>
-                  <div className="mt-2 flex items-center justify-between text-[11px] text-white/50 px-1">
-                    <span>Mốc: {deltaBaselineUI[0]?.toFixed(2) ?? "--"} • Delta chớp 0.08~0.23</span>
-                    <span className="font-mono">{earValues[0]?.toFixed(3) ?? "--"} EAR</span>
                   </div>
 
                   {mode === "single" && (
@@ -1754,7 +1726,7 @@ export default function Page() {
 
       <footer className="mt-auto border-t border-white/5 py-5 text-center text-xs text-white/30">
         <div className="max-w-6xl mx-auto px-4">
-          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60-120 FPS • MediaPipe 478 pts • v0.6.1 • Delta 0.08~0.23 • build 2026-09-02
+          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60-120 FPS • MediaPipe 478 pts • v0.6.2 • Mắt hí & Chớp nhanh • build 2026-09-02
         </div>
       </footer>
     </div>

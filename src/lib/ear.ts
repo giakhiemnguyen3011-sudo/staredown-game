@@ -56,45 +56,63 @@ export class EARSmoother {
   getSmoothed(): number | null { return this.ema; }
 }
 
-// Adaptive threshold based on open-eye baseline
-// - baseline 0.28 -> 0.28*0.62=0.174 -> clamp 0.17
-// - baseline 0.32 -> ~0.198
-// - baseline 0.22 (small eyes) -> clamp 0.17 to avoid too sensitive
+// Adaptive threshold - tối ưu cho mắt hí (nhỏ) và chớp nhanh
+// baseline <0.23 = mắt hí → dùng hệ số nhỏ hơn + clamp thấp hơn để nhạy hơn
 export function getAdaptiveThreshold(baselineOpenEAR: number): number {
   if (!isFinite(baselineOpenEAR) || baselineOpenEAR < 0.15 || baselineOpenEAR > 0.45) return 0.20;
-  const raw = baselineOpenEAR * 0.62;
-  // Clamp to handle glasses/squint: not too low (squint false) not too high (miss blink)
-  return Math.min(0.24, Math.max(0.17, raw));
+  const isSmallEye = baselineOpenEAR < 0.23;
+  const mult = isSmallEye ? 0.58 : 0.62;
+  const low = isSmallEye ? 0.15 : 0.17;
+  const high = isSmallEye ? 0.22 : 0.24;
+  const raw = baselineOpenEAR * mult;
+  return Math.min(high, Math.max(low, raw));
 }
 
-// Robustness for glasses + squint + QUICK BLINK:
-// - Quick blink: eye closes for only 1-2 frames (80-120ms), need to catch even if not super deep
-// - Glasses: blendshape more reliable -> blend >0.55 alone triggers (lowered from 0.65 for speed)
-// - Squint: EAR ~0.17-0.20 but blend low (0.2-0.35) should NOT trigger, need true close
+// Hỗ trợ mắt hí (EAR mở thấp 0.16-0.21) và chớp cực nhanh (80-120ms ≈ 1-2 frame @120fps)
+// - Mắt hí: baseline thấp → threshold thấp, cần phát hiện với độ giảm nhỏ hơn + blend nhẹ
+// - Chớp nhanh: không kịp giảm sâu, dựa vào velocity (raw vs smoothed) + blend
 export function isEyeClosed(ear: number, avgBlend: number | null, threshold: number): boolean {
   const blend = avgBlend ?? 0;
-  if (blend > 0.55) return true; // strong blend alone - lowered for quick blink (glasses)
-  if (ear < threshold - 0.02) return true; // deep close - less deep required (was -0.03)
-  if (ear < threshold - 0.015 && blend > 0.20) return true; // moderately deep + some blend (lowered)
-  if (ear < threshold && blend > 0.30) return true; // just below threshold needs blend (lowered from 0.38)
-  // Quick blink via raw EAR: if EAR drops to < threshold * 0.90 (e.g., 0.18 for thresh 0.20) even with low blend, it's likely a quick close
-  if (ear < threshold * 0.88) return true; // was 0.84, now 0.88 more sensitive (0.176 for 0.20)
-  // Extra quick check: if EAR is < threshold * 0.92 and blend >0.15, also quick
-  if (ear < threshold * 0.92 && blend > 0.15) return true;
+  const isSmallEyeMode = threshold <= 0.17; // suy ra từ baseline <0.23
+
+  // Blend mạnh → nhắm (kính hoặc chớp nhanh). Hạ ngưỡng cho mắt hí
+  if (isSmallEyeMode ? blend > 0.48 : blend > 0.55) return true;
+
+  // Nhắm sâu so với ngưỡng (dung sai nhỏ hơn cho mắt hí)
+  if (isSmallEyeMode) {
+    if (ear < threshold - 0.012) return true; // mắt hí chỉ cần giảm 0.012 so với ngưỡng thấp
+    if (ear < threshold - 0.008 && blend > 0.18) return true;
+    if (ear < threshold && blend > 0.22) return true;
+    if (ear < threshold * 0.90) return true; // nhạy hơn cho mắt hí (0.135 với thresh 0.15)
+    if (ear < threshold * 0.95 && blend > 0.12) return true;
+  } else {
+    if (ear < threshold - 0.02) return true;
+    if (ear < threshold - 0.015 && blend > 0.20) return true;
+    if (ear < threshold && blend > 0.30) return true;
+    if (ear < threshold * 0.88) return true;
+    if (ear < threshold * 0.92 && blend > 0.15) return true;
+  }
   return false;
 }
 
-// For quick blink, check both raw and smoothed - if either triggers, count as closed
+// Chớp cực nhanh: check raw trước, velocity raw vs smoothed
 export function isEyeClosedQuick(rawEar: number, smoothedEar: number, avgBlend: number | null, threshold: number): boolean {
-  // Check raw first for speed (no smoothing lag), then smoothed for stability
   if (isEyeClosed(rawEar, avgBlend, threshold)) return true;
   if (isEyeClosed(smoothedEar, avgBlend, threshold)) return true;
-  // Extra: if raw is significantly lower than smoothed, indicates rapid close
-  if (rawEar < smoothedEar - 0.04 && rawEar < threshold) return true;
+  const isSmallEyeMode = threshold <= 0.17;
+  // Velocity: raw giảm đột ngột so với smoothed → chớp nhanh
+  // Mắt hí cần velocity nhỏ hơn (0.03), mắt thường 0.035
+  const velThresh = isSmallEyeMode ? 0.028 : 0.035;
+  if (rawEar < smoothedEar - velThresh && rawEar < threshold * 1.02) {
+    // kèm blend nhẹ hoặc đã dưới ngưỡng thì tính
+    if ((avgBlend ?? 0) > 0.12 || rawEar < threshold) return true;
+  }
+  // Trường hợp chớp siêu nhanh chỉ 1 frame: raw giảm mạnh nhưng chưa kịp cập nhật smoothed
+  if (rawEar < threshold * 0.92 && (avgBlend ?? 0) > 0.10) return true;
   return false;
 }
 
-// === DELTA METHOD - Theo yêu cầu: lấy mốc lúc bắt đầu, nếu EAR giảm 0.08~0.23 → lập tức nhắm ===
+// Deprecated: đã xóa logic Delta EAR theo yêu cầu - giữ stub để không vỡ import cũ
 export function isEyeClosedDelta(
   rawEar: number,
   smoothedEar: number,
@@ -102,25 +120,8 @@ export function isEyeClosedDelta(
   avgBlend: number | null,
   threshold: number
 ): { closed: boolean; delta: number | null; method: "delta" | "legacy" | "none" } {
-  if (baseline === null || !isFinite(baseline) || baseline < 0.12 || baseline > 0.45) {
-    const legacy = isEyeClosedQuick(rawEar, smoothedEar, avgBlend, threshold);
-    return { closed: legacy, delta: null, method: legacy ? "legacy" : "none" };
-  }
-  const deltaRaw = baseline - rawEar;
-  const deltaSmooth = baseline - smoothedEar;
-  const delta = Math.max(deltaRaw, deltaSmooth);
-  // Yêu cầu chính: giảm 0.08~0.23 so với mốc bắt đầu → lập tức xác nhận nhắm
-  if (delta >= 0.08 && delta <= 0.23) {
-    return { closed: true, delta, method: "delta" };
-  }
-  // Giảm sâu hơn 0.23 (nhắm rất chặt, từ 0.32 xuống 0.05 = 0.27) cũng tính là nhắm
-  if (delta > 0.23) return { closed: true, delta, method: "delta" };
-  // Giảm 0.06~0.08 với blend hỗ trợ vẫn tính để bắt nheo + kính (giữ nhạy)
-  if (delta >= 0.06 && delta < 0.08 && (avgBlend ?? 0) > 0.30) {
-    return { closed: true, delta, method: "delta" };
-  }
-  const legacy = isEyeClosedQuick(rawEar, smoothedEar, avgBlend, threshold);
-  return { closed: legacy, delta, method: legacy ? "legacy" : "none" };
+  const closed = isEyeClosedQuick(rawEar, smoothedEar, avgBlend, threshold);
+  return { closed, delta: null, method: closed ? "legacy" : "none" };
 }
 
 export function formatDuration(ms: number): string {
