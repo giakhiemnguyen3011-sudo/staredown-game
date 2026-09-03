@@ -74,6 +74,9 @@ export default function Page() {
   const [onlineFriendInput, setOnlineFriendInput] = useState("");
   const [_onlineCountdownSync, setOnlineCountdownSync] = useState<number | null>(null);
   const [onlineLobbyTab, setOnlineLobbyTab] = useState<"public" | "all">("public");
+  const [onlineRoomSearch, setOnlineRoomSearch] = useState("");
+  const [onlineCopyFeedback, setOnlineCopyFeedback] = useState<string | null>(null);
+  const [onlineJoinCode, setOnlineJoinCode] = useState("");
 
   // Theme - avoid hydration mismatch (server always midnight, client hydrates then loads stored)
   const [currentTheme, setCurrentTheme] = useState<ThemePreset>(() => {
@@ -100,8 +103,28 @@ export default function Page() {
     online.subscribeLobby(online.netMode);
   }, [mode, online.netMode, online]);
 
+  // Bind remoteStream to remote video element (split-screen right side)
+  useEffect(() => {
+    const v = remoteVideoRef.current;
+    if (!v) return;
+    if (online.remoteStream) {
+      v.srcObject = online.remoteStream;
+      v.play().catch(() => console.warn("[online] remote video play blocked"));
+    } else {
+      v.srcObject = null;
+    }
+  }, [online.remoteStream]);
+
+  // Auto clear copy feedback
+  useEffect(() => {
+    if (!onlineCopyFeedback) return;
+    const t = setTimeout(() => setOnlineCopyFeedback(null), 2000);
+    return () => clearTimeout(t);
+  }, [onlineCopyFeedback]);
+
   // Video / MediaPipe
   const videoRef = useRef<HTMLVideoElement>(null);
+  const remoteVideoRef = useRef<HTMLVideoElement>(null);
   const rafRef = useRef<number>(0);
   const startTimeRef = useRef<number>(0);
   const elapsedRef = useRef<number>(0);
@@ -253,6 +276,10 @@ export default function Page() {
         console.warn("[camera] play() bị chặn, đợi user click Bắt đầu");
       });
       if (v.videoWidth) setVideoSize({ w: v.videoWidth, h: v.videoHeight });
+      // Online split-screen: push local tracks to WebRTC if in online mode
+      if (modeRef.current === "online") {
+        try { onlineRef.current.addLocalStream(stream); } catch (e) { console.warn("[online] addLocalStream failed", e); }
+      }
       setPhase("ready");
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -1373,23 +1400,83 @@ export default function Page() {
             <div className="grid lg:grid-cols-[1.45fr_0.85fr] gap-5">
               {/* Video area reused */}
               <div className="relative overflow-hidden rounded-[24px] border border-white/10 bg-black/60 backdrop-blur">
-                <div className="relative aspect-[16/10] bg-[#0a0f1e] overflow-hidden">
-                  <video ref={videoRef} playsInline muted autoPlay className="w-full h-full object-cover" style={{ transform: "scaleX(-1)" }} />
-                  {showDebug && faceCount > 0 && <EyeOverlay landmarks={landmarksForOverlay} videoWidth={videoSize.w} videoHeight={videoSize.h} blinkState={blinkStates} />}
-                  {phase === "playing" && <div className="absolute inset-0 pointer-events-none overflow-hidden opacity-20"><div className="absolute left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-[scanline_2s_linear_infinite]" /></div>}
+                {/* Split-screen camera: OmeTV style - Trái bạn / Phải đối thủ */}
+                <div className="relative aspect-[16/9] sm:aspect-[18/10] bg-[#0a0f1e] overflow-hidden grid grid-cols-2 divide-x divide-white/10">
+                  {/* Trái: Camera bạn */}
+                  <div className="relative overflow-hidden bg-[#0a0f1e] group/left">
+                    <video ref={videoRef} playsInline muted autoPlay className="w-full h-full object-cover" style={{ transform: "scaleX(-1)" }} />
+                    {showDebug && faceCount > 0 && (
+                      <div className="absolute inset-0" style={{ transform: "scaleX(-1)" }}>
+                        <EyeOverlay landmarks={landmarksForOverlay} videoWidth={videoSize.w} videoHeight={videoSize.h} blinkState={blinkStates} />
+                      </div>
+                    )}
+                    {/* Label bạn */}
+                    <div className="absolute top-2 left-2 flex items-center gap-1.5">
+                      <span className="px-2.5 py-1 rounded-full bg-cyan-500/90 border border-cyan-400 text-white text-[11px] font-black tracking-widest">BẠN</span>
+                      <span className={`hidden sm:inline-flex px-2 py-1 rounded-full backdrop-blur border text-[11px] font-mono ${faceCount === 0 ? "bg-red-500/90 border-red-400 text-white animate-pulse" : "bg-black/60 border-white/15 text-white"}`}>{faceCount === 0 ? "Không thấy mặt" : "● LIVE"}</span>
+                    </div>
+                    <div className="absolute top-2 right-2 hidden sm:flex items-center gap-1">
+                      {earValues.slice(0,1).map((ear, i) => (
+                        <span key={i} className={`px-2 py-1 rounded-full border font-mono text-[11px] backdrop-blur ${blinkStates[i] === "closed" ? "bg-red-500 text-white border-red-400" : blinkStates[i] === "closing" ? "bg-amber-500 text-black border-amber-400" : "bg-black/60 border-white/15 text-white"}`}>{ear.toFixed(2)}</span>
+                      ))}
+                    </div>
+                    <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between">
+                      <div className="flex gap-1.5">{Array.from({ length: 1 }).map((_, i) => (<div key={i} className={`w-2 h-2 rounded-full border border-white/20 shadow ${blinkStates[i] === "closed" ? "bg-red-500 shadow-red-500/30" : blinkStates[i] === "closing" ? "bg-amber-400" : faceCount > i ? "bg-emerald-400" : "bg-white/20"}`} />))}</div>
+                      <span className="text-[10px] px-2 py-1 rounded-full bg-black/60 border border-white/10 text-white/80 truncate max-w-[60%]">{playerName || "Bạn"} • EAR {adaptiveThresholdUI.toFixed(2)}</span>
+                    </div>
+                    {phase === "playing" && <div className="absolute inset-0 pointer-events-none opacity-20"><div className="absolute left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-cyan-400 to-transparent animate-[scanline_2s_linear_infinite]" /></div>}
+                  </div>
+                  {/* Phải: Camera đối thủ - trống nếu chưa ghép */}
+                  <div className="relative overflow-hidden bg-gradient-to-br from-[#0e1220] to-[#111a2e] flex items-center justify-center">
+                    {online.remoteStream && online.opponent ? (
+                      <>
+                        <video ref={remoteVideoRef} playsInline autoPlay className="w-full h-full object-cover" style={{ transform: "scaleX(-1)" }} />
+                        <div className="absolute top-2 left-2 flex items-center gap-1.5">
+                          <span className="px-2.5 py-1 rounded-full bg-fuchsia-500/90 border border-fuchsia-400 text-white text-[11px] font-black tracking-widest">ĐỐI THỦ</span>
+                          <span className={`px-2 py-1 rounded-full text-[11px] font-bold border backdrop-blur ${online.opponent.cameraReady ? "bg-emerald-500 text-white border-emerald-400" : "bg-amber-500/20 text-amber-200 border-amber-500/30"}`}>{online.opponent.cameraReady ? "✓ Sẵn sàng" : "○ Chưa sẵn sàng"}</span>
+                        </div>
+                        <div className="absolute bottom-2 left-2 right-2 flex items-center justify-between">
+                          <span className="text-[11px] px-2 py-1 rounded-full bg-black/60 border border-white/10 text-white truncate max-w-[65%]">{online.opponent.name} • {online.opponent.friendCode}</span>
+                          <span className={`text-[11px] px-2 py-1 rounded-full border font-mono ${online.pingMs < 80 ? "bg-emerald-500/20 border-emerald-500/30 text-emerald-200" : online.pingMs < 150 ? "bg-amber-500/20 border-amber-500/30 text-amber-200" : "bg-red-500/20 border-red-500/30 text-red-200"}`}>{Math.round(online.pingMs)}ms</span>
+                        </div>
+                        <div className="absolute top-2 right-2 px-2 py-1 rounded-full bg-black/60 border border-white/10 text-[10px] text-white/70">{online.netMode.toUpperCase()} {online.isWebRTCReady ? "• P2P" : ""}</div>
+                        {phase === "playing" && <div className="absolute inset-0 pointer-events-none opacity-15"><div className="absolute left-0 right-0 h-[2px] bg-gradient-to-r from-transparent via-fuchsia-400 to-transparent animate-[scanline_2s_linear_infinite]" /></div>}
+                      </>
+                    ) : (
+                      <div className="w-full h-full flex flex-col items-center justify-center p-4 text-center bg-[radial-gradient(circle_at_50%_30%,rgba(99,102,241,0.15),transparent_60%)]">
+                        <div className="w-16 h-16 rounded-2xl bg-white/5 border border-white/10 flex items-center justify-center text-2xl mb-3">{online.phase === "searching" ? "🔍" : online.opponent ? "👤" : "📷"}</div>
+                        <div className="text-sm font-bold text-white/90">{online.phase === "searching" ? "Đang tìm đối thủ..." : online.opponent ? online.opponent.name : "Chưa có đối thủ"}</div>
+                        <div className="text-xs text-white/50 mt-1 leading-relaxed max-w-[220px]">
+                          {online.phase === "searching" ? online.searchingState || "Đang ghép cặp ngẫu nhiên..." : online.phase === "room" && !online.opponent ? "Phòng đã tạo • đang chờ người vào" : "Để trống nếu không có đối tượng để ghép vào (kiểu OmeTV). Hãy tạo phòng hoặc dùng Random."}
+                        </div>
+                        {online.phase === "searching" && <div className="mt-3 w-8 h-8 border-2 border-white/20 border-t-cyan-400 rounded-full animate-spin" />}
+                        {!online.opponent && online.phase !== "searching" && (
+                          <div className="mt-3 flex gap-2">
+                            <button onClick={() => online.startRandomMatchmaking(online.netMode)} className="px-3 py-1.5 rounded-full bg-cyan-500 text-white text-xs font-bold hover:bg-cyan-400">🎲 Tìm nhanh</button>
+                            <button onClick={() => online.createRoomWithVisibility("public")} className="px-3 py-1.5 rounded-full bg-white/10 border border-white/10 text-white text-xs hover:bg-white/15">+ Tạo phòng</button>
+                          </div>
+                        )}
+                        <div className="absolute top-2 left-2 px-2.5 py-1 rounded-full bg-white/5 border border-white/10 text-white/50 text-[11px] font-black tracking-widest">ĐỐI THỦ</div>
+                        <div className="absolute bottom-2 left-2 right-2 flex justify-center">
+                          <span className="text-[11px] px-2.5 py-1 rounded-full bg-black/40 border border-white/10 text-white/60">Trống • chờ ghép cặp</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  {/* Shared overlays covering both */}
                   {trackingWarning && phase !== "finished" && (
-                    <div className="absolute top-12 left-3 right-3 flex justify-center pointer-events-none">
+                    <div className="absolute top-10 left-1/2 -translate-x-1/2 flex justify-center pointer-events-none z-10">
                       <div className="px-3 py-2 rounded-xl bg-amber-500 text-black text-xs font-bold shadow-lg flex items-center gap-2 animate-pulse"><span>⚠️</span><span>{phase === "playing" ? "Mất tín hiệu — giữ mặt trong khung!" : "Không thấy mặt — vào camera, đủ sáng"}</span></div>
                     </div>
                   )}
                   {phase === "countdown" && (
-                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/40 backdrop-blur-[2px]">
-                      <div className="text-[92px] sm:text-[120px] font-black leading-none tracking-tighter text-white drop-shadow-[0_8px_30px_rgba(6,182,212,0.6)] animate-[pulse-eye_0.9s_ease_infinite]">{countdown === 0 ? "GO!" : countdown}</div>
-                      <div className="text-sm tracking-[0.3em] text-white/70 mt-2">ONLINE • ĐỪNG CHỚP • PING {Math.round(online.pingMs || 0)}ms</div>
+                    <div className="absolute inset-0 flex flex-col items-center justify-center bg-black/45 backdrop-blur-[2px] z-10">
+                      <div className="text-[72px] sm:text-[96px] font-black leading-none tracking-tighter text-white drop-shadow-[0_8px_30px_rgba(6,182,212,0.6)] animate-[pulse-eye_0.9s_ease_infinite]">{countdown === 0 ? "GO!" : countdown}</div>
+                      <div className="text-xs sm:text-sm tracking-[0.3em] text-white/70 mt-2">ONLINE • ĐỪNG CHỚP • PING {Math.round(online.pingMs || 0)}ms</div>
                     </div>
                   )}
                   {phase === "finished" && (
-                    <div className="absolute inset-0 flex items-center justify-center bg-black/55 backdrop-blur-sm p-4">
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/55 backdrop-blur-sm p-4 z-20">
                       <div className={`w-full max-w-md rounded-[20px] border backdrop-blur p-5 sm:p-6 text-center shadow-2xl ${endReason === "tracking_lost" ? "bg-red-950/90 border-red-500/30" : winner === 1 ? "bg-emerald-950/90 border-emerald-500/30" : winner === 2 ? "bg-red-950/90 border-red-500/30" : "bg-[#0f1220]/90 border-white/15"}`}>
                         {endReason === "tracking_lost" ? (
                           <>
@@ -1416,25 +1503,10 @@ export default function Page() {
                     </div>
                   )}
                   {phase === "ready" && online.phase !== "room" && online.phase !== "matched" && (
-                    <div className="absolute inset-0 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4">
+                    <div className="absolute inset-0 flex items-center justify-center bg-black/50 backdrop-blur-sm p-4 z-10">
                       <div className="text-center text-white/80 text-sm">Vào phòng hoặc tìm trận để bắt đầu<br/><span className="text-xs text-white/50">Camera đã sẵn sàng • EAR {adaptiveThresholdUI.toFixed(2)}</span></div>
                     </div>
                   )}
-                  <div className="absolute top-3 left-3 right-3 flex items-center justify-between gap-2 pointer-events-none">
-                    <div className="flex items-center gap-2">
-                      <span className={`px-2.5 py-1 rounded-full backdrop-blur border text-xs font-mono ${faceCount === 0 ? "bg-red-500/90 border-red-400 text-white animate-pulse" : "bg-black/55 border-white/15"}`}>{faceCount === 0 ? "Không thấy mặt" : `${faceCount} mặt`}</span>
-                      {phase === "playing" && <span className="hidden sm:inline-flex px-2.5 py-1 rounded-full bg-cyan-500/90 text-white text-xs font-bold">● ONLINE {online.netMode.toUpperCase()} • {Math.round(online.pingMs)}ms</span>}
-                    </div>
-                    <div className="hidden sm:flex items-center gap-1.5 text-xs">
-                      {earValues.map((ear, i) => (
-                        <span key={i} className={`px-2.5 py-1 rounded-full border font-mono backdrop-blur ${blinkStates[i] === "closed" ? "bg-red-500 text-white border-red-400" : blinkStates[i] === "closing" ? "bg-amber-500 text-black border-amber-400" : "bg-black/55 border-white/15"}`}>P{i + 1}: {ear.toFixed(2)} {blinkStates[i] === "closed" ? "• CLOSED" : "• OPEN"}</span>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="absolute bottom-3 left-3 right-3 flex items-center justify-between">
-                    <div className="flex gap-1.5">{Array.from({ length: 1 }).map((_, i) => (<div key={i} className={`w-2.5 h-2.5 rounded-full border border-white/20 shadow ${blinkStates[i] === "closed" ? "bg-red-500 shadow-red-500/30" : blinkStates[i] === "closing" ? "bg-amber-400" : faceCount > i ? "bg-emerald-400" : "bg-white/20"}`} />))}</div>
-                    <span className="text-[11px] px-2 py-1 rounded-full bg-black/50 border border-white/10 text-white/70">BETA • Ping bù desync • EAR {adaptiveThresholdUI.toFixed(2)}</span>
-                  </div>
                 </div>
                 <div className="p-4 sm:p-5 bg-gradient-to-b from-transparent to-white/[0.03] border-t border-white/10 flex flex-wrap gap-2.5 items-center justify-between">
                   <div className="flex flex-wrap gap-2.5">
@@ -1464,88 +1536,148 @@ export default function Page() {
                 <div className="rounded-[24px] border border-white/10 bg-gradient-to-br from-white/[0.06] to-white/[0.02] backdrop-blur p-5 sm:p-6">
                   <div className="flex items-center justify-between">
                     <div className="text-xs tracking-[0.18em] text-white/50 font-semibold">ONLINE LOBBY • BETA</div>
-                    <div className={`w-2 h-2 rounded-full ${online.isConnected ? "bg-emerald-400 animate-pulse shadow shadow-emerald-400/50" : "bg-white/20"}`} />
+                    <div className="flex items-center gap-2">
+                      {onlineCopyFeedback && <span className="text-[11px] px-2 py-1 rounded-full bg-emerald-500 text-white font-bold animate-[fadeIn_0.2s]">{onlineCopyFeedback}</span>}
+                      <div className={`w-2 h-2 rounded-full ${online.isConnected ? "bg-emerald-400 animate-pulse shadow shadow-emerald-400/50" : "bg-white/20"}`} />
+                    </div>
                   </div>
+                  {/* Tài khoản */}
                   <div className="mt-3">
-                    <div className="text-xs text-white/50">Tài khoản</div>
+                    <div className="text-xs text-white/50">Tài khoản & mã bạn bè</div>
                     <div className="mt-1 flex gap-2">
-                      <input value={playerName} onChange={e => setPlayerName(e.target.value)} placeholder="Tên bạn (xác nhận)" maxLength={18} className="flex-1 px-3 py-2 rounded-xl bg-white/5 border border-white/10 focus:border-cyan-400 outline-none text-sm" />
-                      <span className="px-3 py-2 rounded-xl bg-cyan-500/15 border border-cyan-500/20 text-xs font-mono self-center">{online.friendCode}</span>
+                      <input value={playerName} onChange={e => setPlayerName(e.target.value)} placeholder="Tên bạn (hiển thị)" maxLength={18} className="flex-1 px-3 py-2 rounded-xl bg-white/5 border border-white/10 focus:border-cyan-400 outline-none text-sm" />
+                      <div className="px-3 py-2 rounded-xl bg-cyan-500/15 border border-cyan-500/20 text-xs font-mono self-center flex items-center gap-1.5 shrink-0">
+                        <span className="font-black tracking-widest">{online.friendCode}</span>
+                        {online.isConnected && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />}
+                      </div>
                     </div>
-                    <div className="mt-2 flex gap-2 text-xs">
-                      <button onClick={() => { const c = online.regenerateCode(); setOnlineFriendInput(c); }} className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 hover:bg-white/10">↻ Đổi mã</button>
-                      <button onClick={() => { navigator.clipboard?.writeText(online.friendCode); }} className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 hover:bg-white/10">⎘ Copy mã</button>
-                      <span className="self-center text-white/40">Mã bạn bè của bạn</span>
+                    <div className="mt-2 flex gap-2 text-xs flex-wrap">
+                      <button onClick={() => { const c = online.regenerateCode(); setOnlineFriendInput(c); setOnlineCopyFeedback("Đã đổi mã ✓"); }} className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 hover:bg-white/10">↻ Đổi mã</button>
+                      <button onClick={() => { navigator.clipboard?.writeText(online.friendCode); setOnlineCopyFeedback("Đã copy mã ✓"); }} className="px-3 py-1.5 rounded-full bg-cyan-500/15 border border-cyan-500/20 text-cyan-200 hover:bg-cyan-500/20">⎘ Copy mã</button>
+                      <button onClick={() => { if (navigator.share) navigator.share({ title: "Staredown - Friend Code", text: `Mã bạn bè của tôi: ${online.friendCode} - vào Staredown Online để đấu!` }).catch(()=>{}); else { navigator.clipboard?.writeText(online.friendCode); setOnlineCopyFeedback("Đã copy mã ✓"); } }} className="px-3 py-1.5 rounded-full bg-white/5 border border-white/10 hover:bg-white/10">↗ Chia sẻ</button>
                     </div>
                   </div>
-
+                  {/* Net mode */}
                   <div className="mt-4 grid grid-cols-2 gap-2">
-                    <button onClick={() => online.setNetMode("global")} className={`py-2 rounded-xl border text-xs font-bold transition ${online.netMode === "global" ? "bg-cyan-500 text-white border-cyan-400" : "bg-white/5 border-white/10 text-white/70"}`}>🌍 Global</button>
-                    <button onClick={() => online.setNetMode("lan")} className={`py-2 rounded-xl border text-xs font-bold transition ${online.netMode === "lan" ? "bg-emerald-500 text-white border-emerald-400" : "bg-white/5 border-white/10 text-white/70"}`}>🏠 LAN</button>
+                    <button onClick={() => online.setNetMode("global")} className={`py-2.5 rounded-xl border text-xs font-bold transition ${online.netMode === "global" ? "bg-cyan-500 text-white border-cyan-400 shadow" : "bg-white/5 border-white/10 text-white/70 hover:bg-white/10"}`}>🌍 Global • Realtime</button>
+                    <button onClick={() => online.setNetMode("lan")} className={`py-2.5 rounded-xl border text-xs font-bold transition ${online.netMode === "lan" ? "bg-emerald-500 text-white border-emerald-400 shadow" : "bg-white/5 border-white/10 text-white/70 hover:bg-white/10"}`}>🏠 LAN • P2P</button>
                   </div>
-                  <div className="text-xs text-white/40 mt-1">{online.netMode === "lan" ? "LAN: ưu tiên WebRTC P2P (~10-30ms), nếu thất bại fallback Supabase" : "Global: Supabase Realtime (~50-120ms) + bù ping"}</div>
-
-                  <div className="mt-4 space-y-2">
+                  <div className="text-xs text-white/40 mt-1.5 flex justify-between"><span>{online.netMode === "lan" ? "LAN: WebRTC P2P ~10-30ms" : "Global: ~50-120ms + bù ping"}</span><span className={online.isWebRTCReady ? "text-emerald-300" : "text-white/30"}>{online.isWebRTCReady ? "P2P ✓" : online.netMode === "lan" ? "đang thử P2P..." : ""}</span></div>
+                  {/* Trạng thái phòng hiện tại */}
+                  <div className="mt-4">
                     {online.phase === "idle" || online.phase === "searching" ? (
-                      <>
-                        <button onClick={() => online.phase === "searching" ? online.cancelMatchmaking() : online.startRandomMatchmaking(online.netMode)} className={`w-full py-3 rounded-xl font-black text-sm transition ${online.phase === "searching" ? "bg-amber-500 text-black" : "bg-gradient-to-r from-cyan-600 to-blue-600 text-white hover:from-cyan-500 hover:to-blue-500"}`}>
-                          {online.phase === "searching" ? `✕ Hủy tìm • ${online.searchingState}` : `🎲 Random Matchmaking (${online.netMode.toUpperCase()})`}
+                      <div className="space-y-2">
+                        <button onClick={() => online.phase === "searching" ? online.cancelMatchmaking() : online.startRandomMatchmaking(online.netMode)} className={`w-full py-3.5 rounded-xl font-black text-sm transition flex items-center justify-center gap-2 ${online.phase === "searching" ? "bg-amber-500 text-black animate-pulse" : "bg-gradient-to-r from-cyan-600 to-blue-600 text-white hover:from-cyan-500 hover:to-blue-500 shadow-lg shadow-cyan-600/20"}`}>
+                          {online.phase === "searching" ? <><span className="w-4 h-4 border-2 border-black/30 border-t-black rounded-full animate-spin" /> Hủy tìm • {online.searchingState}</> : <>🎲 Ghép ngẫu nhiên — OmeTV ({online.netMode.toUpperCase()})</>}
                         </button>
-                        {online.errorMsg && <div className="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/20 rounded-xl p-2">{online.errorMsg}</div>}
-                      </>
+                        <div className="text-[11px] text-white/35 text-center">Tự động tìm phòng Public trống • không cần mã</div>
+                        {online.errorMsg && <div className="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/20 rounded-xl p-2.5 flex gap-2"><span>⚠️</span><span>{online.errorMsg}</span></div>}
+                      </div>
                     ) : (
-                      <div className="p-3 rounded-xl bg-white/5 border border-white/10 text-sm">
-                        <div className="font-bold">Phòng: <span className="font-mono text-cyan-300">{online.roomCode}</span> • {online.role === "host" ? "Host" : "Guest"} • {online.netMode.toUpperCase()} {online.isWebRTCReady ? "• P2P ✓" : ""}</div>
-                        <div className="text-xs text-white/60 mt-1">{online.searchingState || (online.opponent ? `vs ${online.opponent.name}` : "Chờ đối thủ...")}</div>
-                        <button onClick={() => online.leaveRoom()} className="mt-2 w-full py-2 rounded-full bg-red-500/15 border border-red-500/20 text-red-200 text-xs font-bold hover:bg-red-500/20">✕ Rời phòng</button>
+                      <div className="p-3 rounded-xl bg-gradient-to-br from-cyan-500/15 to-blue-500/10 border border-cyan-500/20 space-y-2">
+                        <div className="flex items-center justify-between">
+                          <div className="font-bold text-sm">Phòng <span className="font-mono text-cyan-300 tracking-widest text-base">{online.roomCode}</span></div>
+                          <span className={`text-[11px] px-2 py-1 rounded-full font-black ${online.role === "host" ? "bg-amber-400 text-black" : "bg-white/10 border border-white/10 text-white/70"}`}>{online.role === "host" ? "HOST" : "GUEST"}</span>
+                        </div>
+                        <div className="flex gap-2">
+                          <button onClick={() => { navigator.clipboard?.writeText(online.roomCode || ""); setOnlineCopyFeedback(`Đã copy mã phòng ${online.roomCode} ✓`); }} className="flex-1 py-2 rounded-xl bg-white text-black text-xs font-black hover:bg-zinc-100">⎘ Copy mã phòng</button>
+                          <button onClick={() => online.leaveRoom()} className="px-4 py-2 rounded-xl bg-red-500/15 border border-red-500/20 text-red-200 text-xs font-bold hover:bg-red-500/20">✕ Rời</button>
+                        </div>
+                        <div className="text-xs text-white/60 flex items-center gap-1.5"><span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />{online.searchingState || (online.opponent ? `vs ${online.opponent.name}` : "Đang chờ đối thủ vào...")} • {online.netMode.toUpperCase()} {online.isWebRTCReady ? "• P2P" : ""}</div>
                       </div>
                     )}
                   </div>
-
-                  <div className="mt-3 p-3 rounded-xl bg-white/5 border border-white/10 space-y-3">
+                  {/* Tạo phòng & Nhập mã - cải thiện */}
+                  <div className="mt-4 p-3.5 rounded-xl bg-white/5 border border-white/10 space-y-4">
+                    {/* Tạo phòng */}
                     <div>
-                      <div className="text-xs font-bold text-white/70">Tạo phòng — chọn quyền riêng tư</div>
-                      <div className="mt-1 flex gap-2">
-                        <button onClick={() => online.setRoomVisibility("public")} className={`flex-1 py-2 rounded-xl border text-xs font-bold transition ${online.roomVisibility === "public" ? "bg-emerald-500 text-white border-emerald-400" : "bg-white/5 border-white/10 text-white/60 hover:bg-white/10"}`}>🌐 Public</button>
-                        <button onClick={() => online.setRoomVisibility("friend")} className={`flex-1 py-2 rounded-xl border text-xs font-bold transition ${online.roomVisibility === "friend" ? "bg-amber-500 text-black border-amber-400" : "bg-white/5 border-white/10 text-white/60 hover:bg-white/10"}`}>🔒 Friend-only</button>
-                      </div>
-                      <button onClick={() => online.createRoomWithVisibility(online.roomVisibility)} className="mt-2 w-full py-2.5 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 text-white text-xs font-black hover:from-cyan-500 hover:to-blue-500">+ Tạo phòng {online.roomVisibility === "public" ? "Public" : "Friend-only"} ({online.netMode.toUpperCase()})</button>
-                      <div className="text-xs text-white/40 mt-1">{online.roomVisibility === "public" ? "Public: hiện trong tab tìm phòng, ai cũng vào được" : "Friend-only: vẫn hiện trong tab nhưng chỉ vào được bằng mã"}</div>
-                    </div>
-                    <div className="border-t border-white/10 pt-3">
-                      <div className="text-xs font-bold text-white/70">Hoặc nhập Friend Code</div>
-                      <div className="mt-1 flex gap-2">
-                        <input value={onlineFriendInput} onChange={e => setOnlineFriendInput(e.target.value.toUpperCase())} placeholder="Nhập mã (ABCD12)" maxLength={8} className="flex-1 px-3 py-2 rounded-xl bg-black/30 border border-white/10 focus:border-cyan-400 outline-none font-mono text-sm uppercase" />
-                        <button onClick={() => { if (onlineFriendInput.trim()) online.joinFriendRoom(onlineFriendInput); }} className="px-3 py-2 rounded-xl bg-cyan-500 text-white text-xs font-bold hover:bg-cyan-400">Vào</button>
-                      </div>
-                    </div>
-                    <div className="border-t border-white/10 pt-3">
                       <div className="flex items-center justify-between">
-                        <div className="text-xs font-bold text-white/70">Danh sách phòng — {online.netMode.toUpperCase()}</div>
-                        <div className="flex p-1 rounded-full bg-white/5 border border-white/10">
-                          <button onClick={() => setOnlineLobbyTab("public")} className={`px-2.5 py-1 rounded-full text-xs font-bold transition ${onlineLobbyTab === "public" ? "bg-cyan-500 text-white shadow" : "text-white/60 hover:text-white"}`}>Public</button>
-                          <button onClick={() => setOnlineLobbyTab("all")} className={`px-2.5 py-1 rounded-full text-xs font-bold transition ${onlineLobbyTab === "all" ? "bg-cyan-500 text-white shadow" : "text-white/60 hover:text-white"}`}>Tất cả</button>
+                        <div className="text-xs font-black tracking-widest text-white/70">TẠO PHÒNG</div>
+                        <span className="text-[11px] text-white/40">1-click • hiện ngay trong danh sách</span>
+                      </div>
+                      <div className="mt-2 grid grid-cols-2 gap-2">
+                        <button onClick={() => online.setRoomVisibility("public")} className={`py-2.5 rounded-xl border text-xs font-bold transition flex flex-col items-center gap-0.5 ${online.roomVisibility === "public" ? "bg-emerald-500 text-white border-emerald-400 shadow" : "bg-black/20 border-white/10 text-white/60 hover:bg-white/10"}`}>
+                          <span>🌐 Public</span><span className="text-[11px] opacity-70">Ai cũng vào được</span>
+                        </button>
+                        <button onClick={() => online.setRoomVisibility("friend")} className={`py-2.5 rounded-xl border text-xs font-bold transition flex flex-col items-center gap-0.5 ${online.roomVisibility === "friend" ? "bg-amber-500 text-black border-amber-400 shadow" : "bg-black/20 border-white/10 text-white/60 hover:bg-white/10"}`}>
+                          <span>🔒 Friend-only</span><span className="text-[11px] opacity-70">Cần mã mới vào</span>
+                        </button>
+                      </div>
+                      <button onClick={() => { const code = online.createRoomWithVisibility(online.roomVisibility); setOnlineCopyFeedback(`Đã tạo phòng ${code} ✓`); }} disabled={online.phase === "room" || online.phase === "matched"} className="mt-2 w-full py-3 rounded-xl bg-gradient-to-r from-cyan-600 to-blue-600 text-white text-sm font-black hover:from-cyan-500 hover:to-blue-500 disabled:opacity-40 disabled:cursor-not-allowed shadow">
+                        + Tạo phòng {online.roomVisibility === "public" ? "Public" : "Friend-only"} — {online.netMode.toUpperCase()}
+                      </button>
+                      {online.phase === "room" && online.roomCode && <div className="mt-2 p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-center"><span className="text-xs text-white/60">Mã phòng của bạn: </span><span className="font-mono font-black text-emerald-300 tracking-widest">{online.roomCode}</span><span className="ml-2 text-xs text-white/50">• đang chờ đối thủ (split-screen phải trống cho tới khi có người vào)</span></div>}
+                    </div>
+                    {/* Nhập mã - cải thiện với validation */}
+                    <div className="border-t border-white/10 pt-4">
+                      <div className="text-xs font-black tracking-widest text-white/70">NHẬP MÃ ĐỂ VÀO PHÒNG</div>
+                      <div className="mt-2 flex gap-2">
+                        <div className="flex-1 relative">
+                          <input value={onlineFriendInput} onChange={e => { const v = e.target.value.toUpperCase().replace(/[^A-Z0-9]/g,""); setOnlineFriendInput(v); if (v.length>=4) setOnlineJoinCode(v); }} placeholder="Nhập mã 6 ký tự (VD: A1B2C3)" maxLength={8} className="w-full px-3 py-2.5 rounded-xl bg-black/30 border border-white/10 focus:border-cyan-400 outline-none font-mono text-sm uppercase tracking-widest" />
+                          {onlineFriendInput.length>0 && <button onClick={() => setOnlineFriendInput("")} className="absolute right-2 top-1/2 -translate-y-1/2 w-6 h-6 rounded-full bg-white/10 text-white/60 text-xs flex items-center justify-center hover:bg-white/15">✕</button>}
+                        </div>
+                        <button onClick={() => { if (onlineFriendInput.trim().length>=4) { online.joinFriendRoom(onlineFriendInput); setOnlineCopyFeedback(`Đang vào phòng ${onlineFriendInput}...`); } else { setOnlineCopyFeedback("Mã phải 4-8 ký tự"); } }} disabled={onlineFriendInput.trim().length<4} className="px-5 py-2.5 rounded-xl bg-cyan-500 text-white text-sm font-black hover:bg-cyan-400 disabled:opacity-40 disabled:cursor-not-allowed shrink-0">Vào phòng</button>
+                      </div>
+                      <div className="mt-1.5 text-[11px] text-white/35">Nhận mã từ bạn bè hoặc copy từ danh sách bên dưới • tự động chuyển chữ hoa, lọc ký tự lạ</div>
+                      {online.errorMsg && online.phase === "room" && <div className="mt-2 text-xs text-red-200 bg-red-500/10 border border-red-500/20 rounded-lg p-2">{online.errorMsg}</div>}
+                    </div>
+                    {/* Danh sách phòng - cải thiện search */}
+                    <div className="border-t border-white/10 pt-4">
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="text-xs font-black tracking-widest text-white/70">TÌM PHÒNG • {online.netMode.toUpperCase()}</div>
+                        <div className="flex items-center gap-1.5">
+                          <button onClick={() => online.subscribeLobby(online.netMode)} className="px-2.5 py-1 rounded-full bg-white/5 border border-white/10 text-xs hover:bg-white/10">↻ Làm mới</button>
+                          <div className="flex p-1 rounded-full bg-black/20 border border-white/10">
+                            <button onClick={() => setOnlineLobbyTab("public")} className={`px-2.5 py-1 rounded-full text-xs font-bold transition ${onlineLobbyTab === "public" ? "bg-cyan-500 text-white shadow" : "text-white/60 hover:text-white"}`}>Public</button>
+                            <button onClick={() => setOnlineLobbyTab("all")} className={`px-2.5 py-1 rounded-full text-xs font-bold transition ${onlineLobbyTab === "all" ? "bg-cyan-500 text-white shadow" : "text-white/60 hover:text-white"}`}>Tất cả</button>
+                          </div>
                         </div>
                       </div>
-                      <div className="mt-2 space-y-2 max-h-[180px] overflow-auto pr-1">
-                        {online.publicRooms.length === 0 && (
-                          <div className="text-xs text-white/40 text-center py-4 border border-dashed border-white/10 rounded-xl">Chưa có phòng nào — hãy tạo Public để hiện ở đây<br/><span className="text-white/30">Random sẽ vào nhanh phòng Public</span></div>
-                        )}
-                        {online.publicRooms.length > 0 && online.publicRooms.filter(r => onlineLobbyTab === "public" ? r.visibility === "public" : true).map(r => (
-                          <div key={r.code} className="flex items-center gap-2 p-2 rounded-xl bg-white/5 border border-white/5">
-                            <div className="flex-1 min-w-0">
-                              <div className="text-sm font-mono font-bold flex items-center gap-1.5">{r.code} <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-black ${r.visibility === "public" ? "bg-emerald-500 text-white" : "bg-amber-500 text-black"}`}>{r.visibility === "public" ? "Public" : "Friend"}</span> <span className="text-[10px] px-1 py-0.5 rounded-full bg-white/10 border border-white/10">{r.netMode.toUpperCase()}</span></div>
-                              <div className="text-xs text-white/50 truncate">{r.hostName} • {new Date(r.createdAt).toLocaleTimeString("vi-VN")}</div>
-                            </div>
-                            {r.visibility === "public" ? (
-                              <button onClick={() => online.joinPublicRoom(r.code)} className="px-3 py-1.5 rounded-full bg-emerald-500 text-white text-xs font-bold hover:bg-emerald-400">Vào</button>
-                            ) : (
-                              <span className="px-2.5 py-1 rounded-full bg-white/5 border border-white/10 text-xs text-white/40">Cần mã</span>
-                            )}
-                          </div>
-                        ))}
+                      {/* Search */}
+                      <div className="mt-2 relative">
+                        <span className="absolute left-3 top-1/2 -translate-y-1/2 text-white/30 text-sm">🔍</span>
+                        <input value={onlineRoomSearch} onChange={e => setOnlineRoomSearch(e.target.value)} placeholder="Tìm theo mã phòng hoặc tên host..." className="w-full pl-9 pr-8 py-2.5 rounded-xl bg-black/30 border border-white/10 focus:border-cyan-400 outline-none text-sm" />
+                        {onlineRoomSearch && <button onClick={() => setOnlineRoomSearch("")} className="absolute right-2 top-1/2 -translate-y-1/2 w-6 h-6 rounded-full bg-white/10 text-white/60 text-xs flex items-center justify-center hover:bg-white/15">✕</button>}
                       </div>
-                      <div className="text-xs text-white/30 mt-1">Public: vào tùy ý • Friend-only: hiện nhưng cần mã • Random: vào nhanh Public</div>
+                      <div className="mt-1 flex items-center justify-between text-[11px] text-white/35">
+                        <span>{(() => { const q = onlineRoomSearch.trim().toUpperCase(); const base = online.publicRooms.filter(r => onlineLobbyTab === "public" ? r.visibility === "public" : true); const filtered = q ? base.filter(r => r.code.includes(q) || r.hostName.toUpperCase().includes(q)) : base; return `${filtered.length} phòng ${q ? `• lọc "${q}"` : ""}`; })()}</span>
+                        <span className="hidden sm:inline">Bấm Vào để tham gia ngay</span>
+                      </div>
+                      <div className="mt-2 space-y-2 max-h-[220px] overflow-auto pr-1 custom-scrollbar">
+                        {(() => {
+                          const q = onlineRoomSearch.trim().toUpperCase();
+                          const base = online.publicRooms.filter(r => onlineLobbyTab === "public" ? r.visibility === "public" : true);
+                          const filtered = q ? base.filter(r => r.code.includes(q) || r.hostName.toUpperCase().includes(q)) : base;
+                          const sorted = [...filtered].sort((a,b) => b.createdAt - a.createdAt);
+                          if (sorted.length === 0) {
+                            return (
+                              <div className="text-xs text-white/40 text-center py-6 border border-dashed border-white/10 rounded-xl leading-relaxed">
+                                {q ? `Không tìm thấy phòng nào khớp "${q}"` : "Chưa có phòng nào — hãy tạo Public để hiện ở đây"}
+                                <br/><span className="text-white/30">{q ? "Thử xóa bộ lọc hoặc đổi tab Tất cả" : "Random sẽ ghép nhanh vào phòng Public trống"}</span>
+                                {!q && <div className="mt-3"><button onClick={() => online.createRoomWithVisibility("public")} className="px-4 py-2 rounded-full bg-cyan-500 text-white text-xs font-bold hover:bg-cyan-400">+ Tạo Public ngay</button></div>}
+                              </div>
+                            );
+                          }
+                          return sorted.map(r => (
+                            <div key={r.code} className="flex items-center gap-2 p-2.5 rounded-xl bg-white/5 border border-white/5 hover:bg-white/[0.07] hover:border-white/10 transition">
+                              <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-500/20 to-blue-500/20 border border-white/10 flex items-center justify-center text-xs font-black shrink-0">{r.code.slice(0,2)}</div>
+                              <div className="flex-1 min-w-0">
+                                <div className="text-sm font-mono font-bold flex items-center gap-1.5 flex-wrap">{r.code} <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-black ${r.visibility === "public" ? "bg-emerald-500 text-white" : "bg-amber-500 text-black"}`}>{r.visibility === "public" ? "Public" : "Friend"}</span> <span className="text-[10px] px-1 py-0.5 rounded-full bg-white/10 border border-white/10">{r.netMode.toUpperCase()}</span></div>
+                                <div className="text-xs text-white/50 truncate flex items-center gap-1"><span>{r.hostName}</span><span className="w-1 h-1 rounded-full bg-white/20" />{new Date(r.createdAt).toLocaleTimeString("vi-VN")}<span className="hidden sm:inline">• {Math.floor((Date.now()-r.createdAt)/1000/60)} phút trước</span></div>
+                              </div>
+                              <div className="flex flex-col gap-1 shrink-0">
+                                {r.visibility === "public" ? (
+                                  <button onClick={() => online.joinPublicRoom(r.code)} className="px-4 py-1.5 rounded-full bg-emerald-500 text-white text-xs font-bold hover:bg-emerald-400 shadow">Vào</button>
+                                ) : (
+                                  <span className="px-2.5 py-1 rounded-full bg-white/5 border border-white/10 text-xs text-white/40 text-center">Cần mã</span>
+                                )}
+                                <button onClick={() => { navigator.clipboard?.writeText(r.code); setOnlineCopyFeedback(`Đã copy ${r.code} ✓`); setOnlineFriendInput(r.code); }} className="px-2 py-1 rounded-full bg-white/5 border border-white/10 text-[11px] text-white/60 hover:bg-white/10">⎘ Copy</button>
+                              </div>
+                            </div>
+                          ));
+                        })()}
+                      </div>
+                      <div className="text-xs text-white/30 mt-2 flex gap-2 flex-wrap"><span>💡 Public: vào tùy ý</span><span>• Friend-only: cần mã</span><span>• Có ô tìm kiếm theo mã/tên</span><span>• Tự sắp xếp mới nhất lên đầu</span></div>
                     </div>
                   </div>
                 </div>
