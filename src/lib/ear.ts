@@ -94,6 +94,39 @@ export function isEyeClosedQuick(rawEar: number, smoothedEar: number, avgBlend: 
   return false;
 }
 
+// === NEW DELTA METHOD (baseline trước vào lượt) ===
+// baseline: EAR lúc mắt mở ổn định trước khi countdown/playing
+// Nếu EAR giảm mạnh 0.08~0.15 trong thời gian ngắn → tính là chớp
+// Giữ lại isEyeClosed/isEyeClosedQuick làm fallback nếu cần chỉnh lại
+export function isEyeClosedDelta(
+  rawEar: number,
+  smoothedEar: number,
+  baseline: number | null,
+  avgBlend: number | null,
+  threshold: number
+): { closed: boolean; delta: number | null; method: "delta" | "legacy" | "none" } {
+  if (baseline === null || !isFinite(baseline) || baseline < 0.12 || baseline > 0.45) {
+    // chưa có baseline → dùng legacy
+    const legacy = isEyeClosedQuick(rawEar, smoothedEar, avgBlend, threshold);
+    return { closed: legacy, delta: null, method: legacy ? "legacy" : "none" };
+  }
+  const deltaRaw = baseline - rawEar;
+  const deltaSmooth = baseline - smoothedEar;
+  const delta = Math.max(deltaRaw, deltaSmooth);
+  // Giảm 0.08~0.15 trong ngắn hạn → chớp. Cho phép 0.07-0.16 để dung sai
+  if (delta >= 0.07 && delta <= 0.18) {
+    // Đảm bảo không phải nheo nhẹ: cần rawEar thực sự thấp hơn ngưỡng hoặc blend hỗ trợ
+    if (rawEar < threshold || smoothedEar < threshold || (avgBlend ?? 0) > 0.25) {
+      return { closed: true, delta, method: "delta" };
+    }
+  }
+  // Giảm sâu hơn 0.15 → chắc chắn nhắm
+  if (delta > 0.15) return { closed: true, delta, method: "delta" };
+  // Fallback legacy nếu delta chưa đủ nhưng legacy lại bắt được (giữ để phòng chỉnh lại)
+  const legacy = isEyeClosedQuick(rawEar, smoothedEar, avgBlend, threshold);
+  return { closed: legacy, delta, method: legacy ? "legacy" : "none" };
+}
+
 export function formatDuration(ms: number): string {
   const totalSeconds = Math.floor(ms / 1000);
   const minutes = Math.floor(totalSeconds / 60);
