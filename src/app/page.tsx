@@ -161,10 +161,11 @@ export default function Page() {
   const calibrationSamplesRef = useRef<number[]>([]);
   const adaptiveThresholdRef = useRef<number>(EAR_DEFAULT);
   const [adaptiveThresholdUI, setAdaptiveThresholdUI] = useState<number>(EAR_DEFAULT);
-  // Sudden drop 0.07+ trong 1-3 khung hình -> lập tức nhắm
+  // Sudden drop 0.04+ trong 1-3 khung hình -> lập tức nhắm (giảm từ 0.07 theo yêu cầu)
   const earHistoryRef = useRef<number[][]>([[], []]);
-  const SUDDEN_DROP_THRESHOLD = 0.07;
+  const SUDDEN_DROP_THRESHOLD = 0.04;
   const SUDDEN_DROP_FRAMES = 3;
+  const uiThrottleRef = useRef(0);
   // For countdown tracking lost
   const countdownTrackingLostRef = useRef(0);
   // Online refs for fairness
@@ -653,8 +654,16 @@ export default function Page() {
           .sort((a, b) => a.x - b.x);
 
         const sortedLandmarks = indexed.map(o => o.lm);
-        setLandmarksForOverlay(sortedLandmarks);
-        setFaceCount(faces.length);
+        // Tối ưu: throttle UI update để MediaPipe track nhanh hơn (giảm re-render)
+        uiThrottleRef.current++;
+        const shouldUpdateUI = uiThrottleRef.current % 2 === 0;
+        if (shouldUpdateUI) {
+          setLandmarksForOverlay(sortedLandmarks);
+          setFaceCount(faces.length);
+        } else if (faces.length === 0) {
+          // vẫn cập nhật khi mất mặt để warning kịp thời
+          setFaceCount(faces.length);
+        }
 
         // FPS calc + debug log khi không thấy mặt dù model ready & video playing (giúp chẩn đoán kính/ánh sáng)
         frameCountRef.current++;
@@ -676,8 +685,11 @@ export default function Page() {
         // Không chơi: preview EAR + calibration + countdown abort
         if (phaseRef.current !== "playing") {
           const previewEars = sortedLandmarks.map(lm => calcAvgEAR(lm as never));
-          setEarValues(previewEars);
-          setBlinkStates(sortedLandmarks.map(() => "open" as const));
+          // Throttle preview UI để tăng tốc MediaPipe, vẫn giữ calibration hàng frame
+          if (shouldUpdateUI) {
+            setEarValues(previewEars);
+            setBlinkStates(sortedLandmarks.map(() => "open" as const));
+          }
           // Calibration: collect open-eye EAR during ready/countdown (when face stable)
           if ((phaseRef.current === "ready" || phaseRef.current === "countdown") && sortedLandmarks.length > 0) {
             previewEars.forEach(ear => {
@@ -766,7 +778,7 @@ export default function Page() {
           newEars.push(smoothedEar);
 
           const thresh = adaptiveThresholdRef.current ?? EAR_DEFAULT;
-          // Đột ngột giảm 0.07+ trong 1-3 khung hình → lập tức nhắm (kết hợp ngưỡng để tránh nheo)
+          // Đột ngột giảm 0.04+ trong 1-3 khung hình → lập tức nhắm (kết hợp ngưỡng để tránh nheo mắt)
           const hist = earHistoryRef.current[sortedIdx] ?? (earHistoryRef.current[sortedIdx] = []);
           let isSuddenDrop = false;
           if (hist.length > 0) {
@@ -801,8 +813,11 @@ export default function Page() {
           if (st === "closed") blinkedIndices.push(sortedIdx);
         });
 
-        setEarValues(newEars);
-        setBlinkStates(newStates);
+        // Throttle UI update nhưng vẫn bắt blink mỗi khung để phản ứng nhanh
+        if (shouldUpdateUI || blinkedIndices.length > 0) {
+          setEarValues(newEars);
+          setBlinkStates(newStates);
+        }
 
         if (blinkedIndices.length > 0 && phaseRef.current === "playing") {
           handleBlinkDetected(blinkedIndices);
@@ -1748,7 +1763,7 @@ export default function Page() {
 
       <footer className="mt-auto border-t border-white/5 py-5 text-center text-xs text-white/30">
         <div className="max-w-6xl mx-auto px-4">
-          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60-120 FPS • MediaPipe 478 pts • v0.6.3 • SuddenDrop 0.07/3f • build 2026-09-02
+          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60-120 FPS • MediaPipe 478 pts • v0.6.4 • SuddenDrop 0.04/3f • build 2026-09-03
         </div>
       </footer>
     </div>
