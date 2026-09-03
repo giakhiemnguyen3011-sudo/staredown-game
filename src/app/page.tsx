@@ -1568,7 +1568,7 @@ export default function Page() {
                     {online.phase === "idle" || online.phase === "searching" ? (
                       <div className="space-y-2">
                         <button onClick={() => online.phase === "searching" ? online.cancelMatchmaking() : online.startRandomMatchmaking(online.netMode)} className={`w-full py-3.5 rounded-xl font-black text-sm transition flex items-center justify-center gap-2 ${online.phase === "searching" ? "bg-amber-500 text-black animate-pulse" : "bg-gradient-to-r from-cyan-600 to-blue-600 text-white hover:from-cyan-500 hover:to-blue-500 shadow-lg shadow-cyan-600/20"}`}>
-                          {online.phase === "searching" ? <><span className="w-4 h-4 border-2 border-black/30 border-t-black rounded-full animate-spin" /> Hủy tìm • {online.searchingState}</> : <>🎲 Ghép ngẫu nhiên — OmeTV ({online.netMode.toUpperCase()})</>}
+                          {online.phase === "searching" ? <><span className="w-4 h-4 border-2 border-black/30 border-t-black rounded-full animate-spin" /> Hủy tìm • {online.searchingState}</> : <>🎲 Ghép ngẫu nhiên ({online.netMode.toUpperCase()})</>}
                         </button>
                         <div className="text-[11px] text-white/35 text-center">Tự động tìm phòng Public trống • không cần mã</div>
                         {online.errorMsg && <div className="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/20 rounded-xl p-2.5 flex gap-2"><span>⚠️</span><span>{online.errorMsg}</span></div>}
