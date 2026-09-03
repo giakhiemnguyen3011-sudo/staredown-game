@@ -161,6 +161,10 @@ export default function Page() {
   const calibrationSamplesRef = useRef<number[]>([]);
   const adaptiveThresholdRef = useRef<number>(EAR_DEFAULT);
   const [adaptiveThresholdUI, setAdaptiveThresholdUI] = useState<number>(EAR_DEFAULT);
+  // Sudden drop 0.07+ trong 1-3 khung hình -> lập tức nhắm
+  const earHistoryRef = useRef<number[][]>([[], []]);
+  const SUDDEN_DROP_THRESHOLD = 0.07;
+  const SUDDEN_DROP_FRAMES = 3;
   // For countdown tracking lost
   const countdownTrackingLostRef = useRef(0);
   // Online refs for fairness
@@ -315,6 +319,7 @@ export default function Page() {
       setEarValues([]);
       setFaceCount(0);
       calibrationSamplesRef.current = [];
+      earHistoryRef.current = [[], []];
       // Leave online room when back to menu
       if (onlineRef.current.phase !== "idle") onlineRef.current.leaveRoom();
     } else {
@@ -338,6 +343,7 @@ export default function Page() {
       setTrackingWarning(false);
       smootherRefs.current.forEach(s => s.reset());
       closedFramesRef.current = [0, 0];
+      earHistoryRef.current = [[], []];
       // Finalize adaptive threshold from calibration samples
       if (calibrationSamplesRef.current.length >= 8) {
         const sorted = [...calibrationSamplesRef.current].sort((a,b)=>a-b);
@@ -379,6 +385,7 @@ export default function Page() {
     calibrationSamplesRef.current = [];
     adaptiveThresholdRef.current = EAR_DEFAULT;
     setAdaptiveThresholdUI(EAR_DEFAULT);
+    earHistoryRef.current = [[], []];
     onlineBlinkTsRef.current = { local: null, remote: null };
     onlineFinishedAtRef.current = null;
   }, [landmarkerReady, phase]);
@@ -408,6 +415,7 @@ export default function Page() {
       calibrationSamplesRef.current = [];
       adaptiveThresholdRef.current = EAR_DEFAULT;
       setAdaptiveThresholdUI(EAR_DEFAULT);
+      earHistoryRef.current = [[], []];
       onlineBlinkTsRef.current = { local: null, remote: null };
       onlineFinishedAtRef.current = null;
       setOnlineCountdownSync(detail.startAt);
@@ -758,7 +766,21 @@ export default function Page() {
           newEars.push(smoothedEar);
 
           const thresh = adaptiveThresholdRef.current ?? EAR_DEFAULT;
-          const isClosed = isEyeClosedQuick(rawEar, smoothedEar, avgBlend, thresh);
+          // Đột ngột giảm 0.07+ trong 1-3 khung hình → lập tức nhắm (kết hợp ngưỡng để tránh nheo)
+          const hist = earHistoryRef.current[sortedIdx] ?? (earHistoryRef.current[sortedIdx] = []);
+          let isSuddenDrop = false;
+          if (hist.length > 0) {
+            const maxPrev = Math.max(...hist);
+            const drop = maxPrev - rawEar;
+            if (drop >= SUDDEN_DROP_THRESHOLD && rawEar < thresh + 0.02) {
+              isSuddenDrop = true;
+            }
+          }
+          const isClosedByModel = isEyeClosedQuick(rawEar, smoothedEar, avgBlend, thresh);
+          const isClosed = isClosedByModel || isSuddenDrop;
+          // cập nhật history sau kiểm tra (giữ 3 khung gần nhất)
+          hist.push(rawEar);
+          if (hist.length > SUDDEN_DROP_FRAMES) hist.shift();
 
           if (isClosed) {
             closedFramesRef.current[sortedIdx] = (closedFramesRef.current[sortedIdx] ?? 0) + 1;
@@ -1726,7 +1748,7 @@ export default function Page() {
 
       <footer className="mt-auto border-t border-white/5 py-5 text-center text-xs text-white/30">
         <div className="max-w-6xl mx-auto px-4">
-          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60-120 FPS • MediaPipe 478 pts • v0.6.2 • Mắt hí & Chớp nhanh • build 2026-09-02
+          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60-120 FPS • MediaPipe 478 pts • v0.6.3 • SuddenDrop 0.07/3f • build 2026-09-02
         </div>
       </footer>
     </div>
