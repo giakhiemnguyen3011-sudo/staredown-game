@@ -161,9 +161,9 @@ export default function Page() {
   const calibrationSamplesRef = useRef<number[]>([]);
   const adaptiveThresholdRef = useRef<number>(EAR_DEFAULT);
   const [adaptiveThresholdUI, setAdaptiveThresholdUI] = useState<number>(EAR_DEFAULT);
-  // Sudden drop 0.04+ trong 1-3 khung hình -> lập tức nhắm (giảm từ 0.07 theo yêu cầu)
+  // Sudden drop 0.035+ trong 1-3 khung hình -> lập tức nhắm (giảm từ 0.04, bắt chớp cực nhanh; nheo được lọc bằng velocity)
   const earHistoryRef = useRef<number[][]>([[], []]);
-  const SUDDEN_DROP_THRESHOLD = 0.04;
+  const SUDDEN_DROP_THRESHOLD = 0.035;
   const SUDDEN_DROP_FRAMES = 3;
   const uiThrottleRef = useRef(0);
   // For countdown tracking lost
@@ -778,13 +778,18 @@ export default function Page() {
           newEars.push(smoothedEar);
 
           const thresh = adaptiveThresholdRef.current ?? EAR_DEFAULT;
-          // Đột ngột giảm 0.04+ trong 1-3 khung hình → lập tức nhắm (kết hợp ngưỡng để tránh nheo mắt)
+          // Đột ngột giảm 0.035+ trong 1-3 khung hình → lập tức nhắm; nheo mắt được lọc vì không có velocity cao
           const hist = earHistoryRef.current[sortedIdx] ?? (earHistoryRef.current[sortedIdx] = []);
           let isSuddenDrop = false;
           if (hist.length > 0) {
             const maxPrev = Math.max(...hist);
             const drop = maxPrev - rawEar;
-            if (drop >= SUDDEN_DROP_THRESHOLD && rawEar < thresh + 0.02) {
+            // Bỏ ràng buộc rawEar < thresh+0.02 để bắt chớp nhanh chỉ hơi khép (0.20) - nheo vẫn an toàn vì nheo giảm từ từ
+            if (drop >= SUDDEN_DROP_THRESHOLD) {
+              // Nheo mắt giảm từ từ ~0.01-0.015/khung, không đạt 0.035/1-3 khung; chớp nhanh đạt 0.05-0.12/1 khung
+              isSuddenDrop = true;
+            } else if (drop >= 0.025 && (avgBlend ?? 0) > 0.25) {
+              // Drop nhỏ 0.025-0.035 nhưng blend hỗ trợ → vẫn tính để bắt mắt hí chớp nhanh (nheo blend thấp nên không trigger)
               isSuddenDrop = true;
             }
           }
@@ -1763,7 +1768,7 @@ export default function Page() {
 
       <footer className="mt-auto border-t border-white/5 py-5 text-center text-xs text-white/30">
         <div className="max-w-6xl mx-auto px-4">
-          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60-120 FPS • MediaPipe 478 pts • v0.6.4 • SuddenDrop 0.04/3f • build 2026-09-03
+          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60-120 FPS • MediaPipe 478 pts • v0.6.5 • SuddenDrop 0.035/3f FastBlink • build 2026-09-03
         </div>
       </footer>
     </div>

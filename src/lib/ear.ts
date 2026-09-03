@@ -68,47 +68,49 @@ export function getAdaptiveThreshold(baselineOpenEAR: number): number {
   return Math.min(high, Math.max(low, raw));
 }
 
-// Hỗ trợ mắt hí (EAR mở thấp 0.16-0.21) và chớp cực nhanh (80-120ms ≈ 1-2 frame @120fps)
+// Hỗ trợ mắt hí (EAR mở thấp 0.16-0.21) và chớp cực nhanh (60-120ms ≈ 1 frame @120fps)
 // - Mắt hí: baseline thấp → threshold thấp, cần phát hiện với độ giảm nhỏ hơn + blend nhẹ
-// - Chớp nhanh: không kịp giảm sâu, dựa vào velocity (raw vs smoothed) + blend
+// - Chớp nhanh: không kịp giảm sâu, dựa vào velocity (raw vs smoothed) + blend + sudden drop 0.035 đã xử lý ở page
 export function isEyeClosed(ear: number, avgBlend: number | null, threshold: number): boolean {
   const blend = avgBlend ?? 0;
   const isSmallEyeMode = threshold <= 0.17; // suy ra từ baseline <0.23
 
-  // Blend mạnh → nhắm (kính hoặc chớp nhanh). Hạ ngưỡng cho mắt hí
-  if (isSmallEyeMode ? blend > 0.48 : blend > 0.55) return true;
+  // Blend mạnh → nhắm (kính hoặc chớp nhanh). Hạ ngưỡng cho mắt hí & chớp nhanh
+  if (isSmallEyeMode ? blend > 0.42 : blend > 0.50) return true;
 
-  // Nhắm sâu so với ngưỡng (dung sai nhỏ hơn cho mắt hí)
+  // Nhắm sâu so với ngưỡng (dung sai nhỏ hơn cho mắt hí, giữ nheo mắt cần blend cao)
   if (isSmallEyeMode) {
-    if (ear < threshold - 0.012) return true; // mắt hí chỉ cần giảm 0.012 so với ngưỡng thấp
-    if (ear < threshold - 0.008 && blend > 0.18) return true;
-    if (ear < threshold && blend > 0.22) return true;
-    if (ear < threshold * 0.90) return true; // nhạy hơn cho mắt hí (0.135 với thresh 0.15)
-    if (ear < threshold * 0.95 && blend > 0.12) return true;
+    if (ear < threshold - 0.010) return true; // mắt hí chỉ cần giảm 0.010
+    if (ear < threshold - 0.006 && blend > 0.15) return true;
+    if (ear < threshold && blend > 0.18) return true;
+    if (ear < threshold * 0.92) return true; // 0.138 với thresh 0.15 - nhạy hơn
+    if (ear < threshold * 0.97 && blend > 0.10) return true;
   } else {
-    if (ear < threshold - 0.02) return true;
-    if (ear < threshold - 0.015 && blend > 0.20) return true;
-    if (ear < threshold && blend > 0.30) return true;
-    if (ear < threshold * 0.88) return true;
-    if (ear < threshold * 0.92 && blend > 0.15) return true;
+    if (ear < threshold - 0.018) return true; // hạ từ 0.02
+    if (ear < threshold - 0.012 && blend > 0.16) return true;
+    if (ear < threshold && blend > 0.22) return true; // hạ từ 0.30
+    if (ear < threshold * 0.90) return true; // giữ
+    if (ear < threshold * 0.95 && blend > 0.12) return true; // hạ từ 0.92+0.15
   }
   return false;
 }
 
-// Chớp cực nhanh: check raw trước, velocity raw vs smoothed
+// Chớp cực nhanh: check raw trước, velocity raw vs smoothed - tối ưu cho 60-120fps, chỉ 1 khung hình
 export function isEyeClosedQuick(rawEar: number, smoothedEar: number, avgBlend: number | null, threshold: number): boolean {
   if (isEyeClosed(rawEar, avgBlend, threshold)) return true;
   if (isEyeClosed(smoothedEar, avgBlend, threshold)) return true;
   const isSmallEyeMode = threshold <= 0.17;
   // Velocity: raw giảm đột ngột so với smoothed → chớp nhanh
-  // Mắt hí cần velocity nhỏ hơn (0.03), mắt thường 0.035
-  const velThresh = isSmallEyeMode ? 0.028 : 0.035;
-  if (rawEar < smoothedEar - velThresh && rawEar < threshold * 1.02) {
-    // kèm blend nhẹ hoặc đã dưới ngưỡng thì tính
-    if ((avgBlend ?? 0) > 0.12 || rawEar < threshold) return true;
+  // Giảm velThresh để bắt chớp chỉ giảm 0.02-0.03 trong 1 khung - nheo giảm từ từ không đạt
+  const velThresh = isSmallEyeMode ? 0.022 : 0.028;
+  if (rawEar < smoothedEar - velThresh && rawEar < threshold * 1.05) {
+    // kèm blend nhẹ hoặc đã dưới ngưỡng thì tính - hạ blend để nhạy hơn
+    if ((avgBlend ?? 0) > 0.10 || rawEar < threshold + 0.005) return true;
   }
-  // Trường hợp chớp siêu nhanh chỉ 1 frame: raw giảm mạnh nhưng chưa kịp cập nhật smoothed
-  if (rawEar < threshold * 0.92 && (avgBlend ?? 0) > 0.10) return true;
+  // Trường hợp chớp siêu nhanh chỉ 1 frame: raw hơi dưới threshold nhưng blend vừa phải
+  if (rawEar < threshold * 0.96 && (avgBlend ?? 0) > 0.08) return true;
+  // Dự phòng: raw giảm nhanh so với ngưỡng dù blend thấp
+  if (rawEar < threshold * 0.88) return true;
   return false;
 }
 
