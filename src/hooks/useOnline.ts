@@ -229,7 +229,6 @@ export function useOnline(playerName: string) {
       // WebRTC signaling
       .on("broadcast", { event: "webrtc_offer" }, async ({ payload }: { payload: { from: string; sdp: string } }) => {
         if (payload.from === accountRef.current.id) return;
-        if (netMode !== "lan") return;
         // Guest receives offer
         try {
           await ensurePeer(false);
@@ -241,14 +240,12 @@ export function useOnline(playerName: string) {
       })
       .on("broadcast", { event: "webrtc_answer" }, async ({ payload }: { payload: { from: string; sdp: string } }) => {
         if (payload.from === accountRef.current.id) return;
-        if (netMode !== "lan") return;
         try {
           await pcRef.current?.setRemoteDescription(new RTCSessionDescription({ type: "answer", sdp: payload.sdp }));
         } catch (e) { console.warn("[webrtc] answer handling failed", e); }
       })
       .on("broadcast", { event: "webrtc_ice" }, async ({ payload }: { payload: { from: string; candidate: RTCIceCandidateInit } }) => {
         if (payload.from === accountRef.current.id) return;
-        if (netMode !== "lan") return;
         try { await pcRef.current?.addIceCandidate(new RTCIceCandidate(payload.candidate)); } catch (e) { console.warn("[webrtc] ice failed", e); }
       })
       .on("broadcast", { event: "leave" }, ({ payload }: { payload: { from: string } }) => {
@@ -279,7 +276,14 @@ export function useOnline(playerName: string) {
     const ensurePeer = async (isInitiator: boolean) => {
       if (pcRef.current) return;
       const pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        iceServers: [
+          { urls: "stun:stun.l.google.com:19302" },
+          { urls: "stun:stun1.l.google.com:19302" },
+          { urls: "stun:stun2.l.google.com:19302" },
+          { urls: "turn:openrelay.metered.ca:80", username: "openrelayproject", credential: "openrelayproject" },
+          { urls: "turn:openrelay.metered.ca:443", username: "openrelayproject", credential: "openrelayproject" },
+          { urls: "turn:openrelay.metered.ca:443?transport=tcp", username: "openrelayproject", credential: "openrelayproject" },
+        ],
       });
       pc.onicecandidate = (e) => {
         if (e.candidate) {
@@ -364,12 +368,9 @@ export function useOnline(playerName: string) {
         setRoomCode(upper);
         setRole(asRole);
         startPingLoop();
-        // If host and lan mode, attempt webrtc as initiator - increased to avoid race timeout
-        if (asRole === "host" && netMode === "lan") {
-          // delay 1500ms to let guest join (tránh timeout khi guest chậm)
-          setTimeout(() => ensurePeer(true).catch(e=>console.warn(e)), 1500);
-        } else if (asRole === "guest" && netMode === "lan") {
-          // guest will wait for offer
+        // Hỗ trợ cross-network 2 vùng: WebRTC cho cả LAN & Global (STUN+TURN), host luôn tạo offer
+        if (asRole === "host") {
+          setTimeout(() => ensurePeer(true).catch(e=>console.warn(e)), 1200);
         }
         console.log(`[online] joined room ${upper} as ${asRole}`);
       } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
@@ -422,9 +423,14 @@ export function useOnline(playerName: string) {
   const announceRoomInLobby = useCallback((code: string, visibility: "public" | "friend", mode: OnlineNetMode) => {
     const supabase = getSupabase();
     if (!supabase) return;
-    // ensure lobby channel exists and track room
+    const upper = code.toUpperCase();
+    // Optimistic: hiện ngay trong tìm kiếm khi vừa tạo, kèm tag PUBLIC/FRIEND + tên host
+    setPublicRooms(prev => {
+      if (prev.some(r => r.code === upper)) return prev;
+      const newRoom = { code: upper, hostName: playerNameRef.current || "Bạn", hostId: accountRef.current.id, visibility, createdAt: Date.now(), netMode: mode };
+      return [newRoom, ...prev].slice(0, 20);
+    });
     const lobbyChannelName = `online:lobby:${mode}`;
-    // if existing lobby channel is for different mode, resubscribe
     if (lobbyChannelRef.current) {
       try { supabase.removeChannel(lobbyChannelRef.current); } catch {}
       lobbyChannelRef.current = null;
@@ -432,25 +438,25 @@ export function useOnline(playerName: string) {
     const channel = supabase.channel(lobbyChannelName, {
       config: { broadcast: { self: false }, presence: { key: accountRef.current.id } }
     });
+    // Đặt handler trước subscribe để không lỡ sync
+    channel.on("presence", { event: "sync" }, () => {
+      const state = channel.presenceState() as unknown as Record<string, Array<{ roomCode: string; code?: string; hostName: string; hostId: string; visibility: "public" | "friend"; createdAt: number; netMode: OnlineNetMode }>>;
+      const all = Object.values(state).flat();
+      const map = new Map<string, typeof all[0]>();
+      all.forEach(r => {
+        const c = (r as unknown as { code?: string; roomCode?: string }).code || (r as unknown as { roomCode?: string }).roomCode;
+        if (c && !map.has(c)) map.set(c, r);
+      });
+      const mapped = Array.from(map.values()).map(r => {
+        const c = (r as unknown as { code?: string; roomCode?: string }).code || (r as unknown as { roomCode?: string }).roomCode || "";
+        return { code: c, hostName: r.hostName, hostId: r.hostId, visibility: r.visibility, createdAt: r.createdAt, netMode: r.netMode };
+      }).filter(r => r.netMode === mode && r.code).slice(0, 20);
+      if (mapped.length > 0) setPublicRooms(mapped as unknown as Array<{ code: string; hostName: string; hostId: string; visibility: "public" | "friend"; createdAt: number; netMode: OnlineNetMode }>);
+    });
     channel.subscribe(async (status) => {
       if (status === "SUBSCRIBED") {
-        await channel.track({ code: code.toUpperCase(), roomCode: code.toUpperCase(), hostName: playerNameRef.current, hostId: accountRef.current.id, visibility, createdAt: Date.now(), netMode: mode });
-        console.log(`[lobby] announced room ${code} ${visibility} ${mode}`);
-        // also keep publicRooms updated via sync
-        channel.on("presence", { event: "sync" }, () => {
-          const state = channel.presenceState() as unknown as Record<string, Array<{ roomCode: string; code?: string; hostName: string; hostId: string; visibility: "public" | "friend"; createdAt: number; netMode: OnlineNetMode }>>;
-          const all = Object.values(state).flat().filter(r => (r as unknown as { roomCode?: string; code?: string }).roomCode || (r as unknown as { code?: string }).code);
-          const map = new Map<string, typeof all[0]>();
-          all.forEach(r => {
-            const rc = (r as unknown as { code?: string; roomCode?: string }).code || (r as unknown as { roomCode?: string }).roomCode;
-            if (rc && !map.has(rc)) map.set(rc, r);
-          });
-          const mapped = Array.from(map.values()).map(r => {
-            const c = (r as unknown as { code?: string; roomCode?: string }).code || (r as unknown as { roomCode?: string }).roomCode || "";
-            return { code: c, hostName: r.hostName, hostId: r.hostId, visibility: r.visibility, createdAt: r.createdAt, netMode: r.netMode };
-          }).filter(r => r.netMode === mode).slice(0, 20);
-          setPublicRooms(mapped as unknown as Array<{ code: string; hostName: string; hostId: string; visibility: "public" | "friend"; createdAt: number; netMode: OnlineNetMode }>);
-        });
+        await channel.track({ code: upper, roomCode: upper, hostName: playerNameRef.current || "Bạn", hostId: accountRef.current.id, visibility, createdAt: Date.now(), netMode: mode });
+        console.log(`[lobby] announced room ${upper} ${visibility} ${mode} by ${playerNameRef.current}`);
       }
     });
     lobbyChannelRef.current = channel;

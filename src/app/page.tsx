@@ -1754,10 +1754,10 @@ export default function Page() {
                 <div className="rounded-[20px] border border-amber-500/20 bg-amber-500/10 p-4">
                   <div className="text-xs font-bold tracking-widest text-amber-200">BETA • TỐI ƯU MẠNG</div>
                   <ul className="mt-2 space-y-1.5 text-xs text-white/70 leading-relaxed">
-                    <li>• LAN: thử WebRTC P2P trực tiếp, nếu không được fallback Supabase, ping ~10-30ms</li>
-                    <li>• Global: Supabase Realtime Broadcast, ping ~50-120ms, bù ½ RTT để công bằng</li>
+                    <li>• WebRTC P2P (STUN+TURN) cho cả LAN & Global, hỗ trợ 2 vùng mạng khác nhau (NAT), fallback Supabase nếu P2P fail</li>
+                    <li>• LAN: ~10-30ms, Global: ~50-120ms (bù ½ RTT), camera track tại mỗi máy và đồng bộ blink/tracking qua server</li>
                     <li>• Đếm ngược & chớp được đồng bộ bằng timestamp, nếu lệch &lt;120ms tính hòa</li>
-                    <li>• Camera cả hai phải sẵn sàng (thấy mặt) mới cho phép Start — tránh lệch trạng thái</li>
+                    <li>• Phòng PUBLIC/FRIEND đều có tag + tên host hiện trong tìm kiếm ngay khi tạo</li>
                   </ul>
                 </div>
               </div>
@@ -1768,7 +1768,7 @@ export default function Page() {
 
       <footer className="mt-auto border-t border-white/5 py-5 text-center text-xs text-white/30">
         <div className="max-w-6xl mx-auto px-4">
-          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60-120 FPS • MediaPipe 478 pts • v0.6.5 • SuddenDrop 0.035/3f FastBlink • build 2026-09-03
+          © 2026 Staredown • EAR tự động {adaptiveThresholdUI.toFixed(2)} • 60-120 FPS • MediaPipe 478 pts • v0.7.0 • Lobby PUBLIC/FRIEND + Cross-Network WebRTC • build 2026-09-03
         </div>
       </footer>
     </div>
